@@ -588,7 +588,7 @@ container = \"\"
     fn a_config_further_up_is_found_from_inside_a_project() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("aether.toml"), "").unwrap();
-        let deep = dir.path().join("devivace").join("some-app");
+        let deep = dir.path().join("clients").join("some-app");
         std::fs::create_dir_all(&deep).unwrap();
         assert_eq!(
             discover(&deep, None).as_deref(),

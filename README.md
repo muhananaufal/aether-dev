@@ -75,6 +75,7 @@ from a form would throw those away every time somebody changed a number.
 
 Where a service's password comes from is shown; the password itself never is.
 Both of these outputs get pasted into bug reports.
+
 ## Commands
 
 ```
@@ -109,8 +110,8 @@ question "is the database up" should not need a keystroke to answer.
 ```
 ┌ 1 Projects ─────────────────────────────┬ 2 Services ──────────────┐
 │ PROJECT          FRAMEWORK      BRANCH  │ SERVICE      PORT  STATE  │
-│ altrms           Laravel 9.52   fix/…   │ mysql        3306  ready  │
-│ manunggal-queue  Laravel 11.54  featu…  │ redis        6379  stopped│
+│ billing-api      Laravel 9.52   fix/…   │ mysql        3306  ready  │
+│ orders-queue     Laravel 11.54  featu…  │ redis        6379  stopped│
 │ …                                       ├ 3 Ports ─────────────────┤
 │                                         │ 3306  mysql   answering   │
 └ 8 of 34 examined ───────────────────────┴ 3 of 5 answering ─────────┘
@@ -151,7 +152,7 @@ with its own toolchain in front on PATH — so a Laravel 5.8 project boots on
 PHP 7.4 while the shell around it still has 8.2.
 
 ```
-$ adev run sapta-web
+$ adev run shop-web
 adev: php artisan serve · http://localhost:8000
 Laravel development server started: <http://127.0.0.1:8000>
 [...] PHP 7.4.33 Development Server (http://127.0.0.1:8000) started
@@ -160,8 +161,8 @@ Laravel development server started: <http://127.0.0.1:8000>
 `--print` says what would happen without doing it:
 
 ```
-$ adev run sapta-web --print
-sapta-web  C:/Projects/devivace/sapta-web
+$ adev run shop-web --print
+shop-web  C:/Projects/clients/shop-web
   recipe   laravel
   command  php artisan serve
   address  http://localhost:8000
