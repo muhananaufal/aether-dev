@@ -762,6 +762,12 @@ fn condition_style(service: &ServiceStatus) -> Style {
             .add_modifier(Modifier::BOLD),
         (ServiceState::Running, false) => Style::default().fg(paint::WAITING),
         (ServiceState::Stopped, _) => Style::default().fg(paint::MUTED),
+        // Italic rather than another colour: absent is not a worse kind of
+        // stopped, it is a service that was never created, and the row exists
+        // to be acted on rather than worried about.
+        (ServiceState::Absent, _) => Style::default()
+            .fg(paint::MUTED)
+            .add_modifier(Modifier::ITALIC),
     }
 }
 

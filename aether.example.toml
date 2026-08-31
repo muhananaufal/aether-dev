@@ -97,3 +97,24 @@ domains = "domains.toml"
 # binary = "go.exe"
 # bin_subdir = "bin"
 # when = ["go.mod"]
+
+# The services this machine is meant to have.
+#
+# Without this section the list is whatever docker reports, which can only ever
+# be containers that already exist. A service you have defined but never
+# started is exactly the one you open a dashboard to start, so declaring it
+# here makes it visible - shown as "absent" until something creates it.
+#
+# It is also where the details stop being this tool's guesses. The container
+# name, the published port, the hostname and the database user are yours.
+#
+# [service.mysql]
+# container = "mysql-db"        # defaults to the name of the service itself
+# port = 3306                   # kept on the row even while the container is stopped
+# domain = "db.test"            # hostname for `adev domains`
+# panel = "http://localhost:8080"   # a page to open with `o`
+# user = "root"                 # the user a dump connects as
+# password_env = "MYSQL_ROOT_PASSWORD"  # where the password lives in the container
+#
+# A service with no container of its own needs nothing but a name:
+# [service.redis]

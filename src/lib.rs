@@ -5,6 +5,7 @@
 //! how a collector is allowed to report, and `cli` is the non-interactive
 //! surface that the terminal UI is later layered on top of.
 
+pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod db;

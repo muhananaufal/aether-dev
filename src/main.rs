@@ -1,5 +1,6 @@
 //! The `adev` command.
 
+use aether_dev::catalog;
 use aether_dev::cli::{Cli, Command, DbCommand, DomainCommand};
 use aether_dev::config::{self, Config};
 use aether_dev::db::{backup_filename, dump_all_plan, dump_plan, restore_plan, Engine, ExecPlan};
@@ -210,15 +211,15 @@ fn docker_client(config: &Config) -> Result<HttpDockerClient, ExitCode> {
 
 fn load_services(config: &Config, memory: bool) -> Result<Vec<ServiceStatus>, ExitCode> {
     let client = docker_client(config)?;
-    let mut services = client.services().map_err(|error| {
+    let observed = client.services().map_err(|error| {
         eprintln!("adev: {error}");
         ExitCode::from(2)
     })?;
+    let mut services = catalog::merge(&config.services_declared(), &observed);
     probe_all(&mut services, PORT_PROBE);
     if memory {
         fill_memory(&client, &mut services);
     }
-    services.sort_by(|a, b| a.service.cmp(&b.service));
     Ok(services)
 }
 
@@ -406,13 +407,14 @@ fn spawn_collectors(config: &Config, updates: Sender<Update>) {
 
     let endpoint = config.docker.endpoint.clone();
     let docker_host = std::env::var("DOCKER_HOST").ok();
+    let declared = config.services_declared();
     std::thread::spawn(move || {
         let outcome = HttpDockerClient::new(&endpoint, docker_host.as_deref())
             .and_then(|client| client.services());
         let update = match outcome {
-            Ok(mut services) => {
+            Ok(observed) => {
+                let mut services = catalog::merge(&declared, &observed);
                 probe_all(&mut services, PORT_PROBE);
-                services.sort_by(|a, b| a.service.cmp(&b.service));
                 Update::Services(services)
             }
             Err(error) => Update::ServicesFailed(error.to_string()),
@@ -673,26 +675,46 @@ fn domains(config: &Config, command: DomainCommand) -> ExitCode {
     }
 }
 
-/// Finds the container behind a compose service name, accepting the container
-/// name too since that is what `docker ps` shows and what people often type.
-fn container_for(client: &HttpDockerClient, service: &str) -> Result<String, ExitCode> {
-    let services = client.services().map_err(|error| {
+/// Finds the container behind a service name, accepting the container name too
+/// since that is what `docker ps` shows and what people often type.
+///
+/// Declared services are searched alongside the running ones, so a name that
+/// only exists in the configuration still resolves — and a service that was
+/// declared but never created says so, instead of being reported as unknown.
+fn container_for(
+    client: &HttpDockerClient,
+    config: &Config,
+    service: &str,
+) -> Result<String, ExitCode> {
+    let observed = client.services().map_err(|error| {
         eprintln!("adev: {error}");
         ExitCode::from(2)
     })?;
+    let services = catalog::merge(&config.services_declared(), &observed);
 
-    services
+    let found = services
         .iter()
-        .find(|candidate| candidate.service == service || candidate.container == service)
-        .map(|found| found.container.clone())
-        .ok_or_else(|| {
+        .find(|candidate| candidate.service == service || candidate.container == service);
+
+    match found {
+        Some(found) if found.state == ServiceState::Absent => {
+            eprintln!(
+                "adev: {service:?} is declared but has no container called {:?} — create it first \
+                 (docker compose up -d {service})",
+                found.container
+            );
+            Err(ExitCode::from(2))
+        }
+        Some(found) => Ok(found.container.clone()),
+        None => {
             let known: Vec<&str> = services.iter().map(|s| s.service.as_str()).collect();
             eprintln!(
                 "adev: no service called {service:?}; known: {}",
                 known.join(", ")
             );
-            ExitCode::from(2)
-        })
+            Err(ExitCode::from(2))
+        }
+    }
 }
 
 fn db(config: &Config, command: DbCommand) -> ExitCode {
@@ -733,7 +755,7 @@ fn export(
         Ok(client) => client,
         Err(code) => return code,
     };
-    let container = match container_for(&client, service) {
+    let container = match container_for(&client, config, service) {
         Ok(container) => container,
         Err(code) => return code,
     };
@@ -842,7 +864,7 @@ fn import(config: &Config, service: &str, database: &str, file: &Path) -> ExitCo
         Ok(client) => client,
         Err(code) => return code,
     };
-    let container = match container_for(&client, service) {
+    let container = match container_for(&client, config, service) {
         Ok(container) => container,
         Err(code) => return code,
     };
@@ -932,7 +954,7 @@ fn logs(config: &Config, service: &str, follow: bool, tail: Option<u32>) -> Exit
         Ok(client) => client,
         Err(code) => return code,
     };
-    let container = match container_for(&client, service) {
+    let container = match container_for(&client, config, service) {
         Ok(container) => container,
         Err(code) => return code,
     };
@@ -985,18 +1007,26 @@ fn lifecycle(config: &Config, names: &[String], all: bool, action: Action) -> Ex
         Ok(client) => client,
         Err(code) => return code,
     };
-    let services = match client.services() {
+    let observed = match client.services() {
         Ok(services) => services,
         Err(error) => {
             eprintln!("adev: {error}");
             return ExitCode::from(2);
         }
     };
+    let services = catalog::merge(&config.services_declared(), &observed);
 
     // --all means every container there is, so the names are taken from what
-    // docker reports rather than from the command line.
+    // docker reports rather than from the command line. A declared service with
+    // no container is skipped rather than attempted: --all is a convenience,
+    // and it should not turn into a row of failures for services the user never
+    // asked about by name.
     let chosen: Vec<String> = if all {
-        services.iter().map(|s| s.service.clone()).collect()
+        services
+            .iter()
+            .filter(|s| s.state != ServiceState::Absent)
+            .map(|s| s.service.clone())
+            .collect()
     } else {
         names.to_vec()
     };
@@ -1009,13 +1039,19 @@ fn lifecycle(config: &Config, names: &[String], all: bool, action: Action) -> Ex
         let Some(service) = found else {
             // One name nobody recognises must not cancel the others: a typo in
             // the third argument should not leave the first two untouched.
-            eprintln!(
-                "adev: no container for {name:?}; a service the compose file defines but that \
-                 has never been created has nothing to act on"
-            );
+            eprintln!("adev: no service called {name:?}");
             refused = true;
             continue;
         };
+        if service.state == ServiceState::Absent {
+            eprintln!(
+                "adev: {name:?} is declared but has no container called {:?} — create it first \
+                 (docker compose up -d {name})",
+                service.container
+            );
+            refused = true;
+            continue;
+        }
 
         let outcome = match action {
             Action::Start => client.start(&service.container),
