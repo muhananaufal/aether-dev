@@ -248,6 +248,8 @@ pub struct Dashboard {
     /// A destructive action waiting for a yes. It takes the status line so it
     /// cannot be answered by a keystroke meant for something else.
     confirm: Option<String>,
+    /// A line being typed: what it is for, and what has been typed so far.
+    prompt: Option<(String, String)>,
     /// What the container host is costing this machine. Polled on its own
     /// timer, so a slow probe cannot hold up the rest of the screen.
     memory: memory::Reading,
@@ -278,6 +280,7 @@ impl Dashboard {
             settings: Vec::new(),
             detail: None,
             confirm: None,
+            prompt: None,
             memory: memory::Reading::default(),
             ports: Vec::new(),
             ports_error: None,
@@ -365,6 +368,44 @@ impl Dashboard {
 
     pub fn showing_detail(&self) -> bool {
         self.detail.is_some()
+    }
+
+    /// Asks for a line of text: a database name, a file, a hostname.
+    ///
+    /// The dashboard holds the characters and nothing else. What the answer is
+    /// for, and what happens when it arrives, stays with the caller - which is
+    /// how a screen that knows nothing about databases can still ask for one.
+    pub fn ask_for(&mut self, label: impl Into<String>) {
+        self.prompt = Some((label.into(), String::new()));
+    }
+
+    pub fn prompting(&self) -> Option<&str> {
+        self.prompt.as_ref().map(|(label, _)| label.as_str())
+    }
+
+    pub fn type_char(&mut self, c: char) {
+        if let Some((_, typed)) = self.prompt.as_mut() {
+            typed.push(c);
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if let Some((_, typed)) = self.prompt.as_mut() {
+            typed.pop();
+        }
+    }
+
+    /// Takes the answer and closes the prompt. An empty string is a real
+    /// answer - the caller decides whether it will do - while `None` means
+    /// there was nothing being asked.
+    pub fn take_typed(&mut self) -> Option<String> {
+        self.prompt.take().map(|(_, typed)| typed)
+    }
+
+    /// Throws the answer away. Escape must not hand back a half typed name
+    /// that then gets used for something.
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
     }
 
     /// Asks a yes-or-no question that must be answered before anything else
@@ -740,6 +781,21 @@ impl Dashboard {
                 Style::default().fg(paint::BAD).add_modifier(Modifier::BOLD),
             )));
         }
+        // Next, whatever is being typed. A collector finishing mid-word must
+        // not take the line the answer is going into.
+        if let Some((label, typed)) = &self.prompt {
+            return Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {label}: "), Style::default().fg(paint::HEADING)),
+                Span::styled(typed.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                // Somewhere for the next character to land: a prompt with no
+                // cursor reads as a message rather than as a question.
+                Span::styled("█", Style::default().fg(paint::FOCUS)),
+                Span::styled(
+                    "   enter to accept · esc to cancel",
+                    Style::default().fg(paint::MUTED),
+                ),
+            ]));
+        }
         // What just happened takes the line while it is fresh. The counts are
         // still on every pane's frame, so nothing is actually lost.
         if let Some(notice) = &self.notice {
@@ -836,6 +892,12 @@ const KEYS: &[(&str, &str)] = &[
     ("K", "end what holds the selected port"),
     ("v", "the toolchain versions a project resolves to"),
     ("d", "the hostnames the proxy serves"),
+    ("A", "route a new hostname"),
+    ("X", "stop routing one"),
+    ("E", "dump one database to a file"),
+    ("I", "load a dump into a database"),
+    (".", "which .env a project uses, and switch it"),
+    (":", "run one command in a project"),
     ("r", "refresh this pane"),
     ("R", "refresh everything"),
     ("g", "the settings in force, and where they live"),
@@ -1000,41 +1062,61 @@ fn draw_detail(frame: &mut Frame, detail: &Detail) {
 
 /// Draws the key list over whatever is behind it.
 fn draw_help(frame: &mut Frame) {
-    let width = 60;
-    let height = KEYS.len() as u16 + 2;
-    let area = centred(frame.area(), width, height);
-
-    let rows: Vec<Row<'static>> = KEYS
-        .iter()
-        .map(|(key, meaning)| {
-            Row::new(vec![
-                Cell::from(*key).style(Style::default().fg(paint::FOCUS)),
-                Cell::from(*meaning),
-            ])
+    // Two columns, because one is now taller than a 24-row terminal and a key
+    // list that scrolls off the screen is not a key list.
+    let half = KEYS.len().div_ceil(2);
+    let rows: Vec<Row<'static>> = (0..half)
+        .map(|row| {
+            let mut cells = vec![
+                Cell::from(KEYS[row].0).style(Style::default().fg(paint::FOCUS)),
+                Cell::from(KEYS[row].1),
+            ];
+            match KEYS.get(row + half) {
+                Some((key, meaning)) => {
+                    cells.push(Cell::from(*key).style(Style::default().fg(paint::FOCUS)));
+                    cells.push(Cell::from(*meaning));
+                }
+                // An odd number of keys leaves the last cell empty rather than
+                // wrapping one entry onto a row of its own.
+                None => cells.extend([Cell::from(""), Cell::from("")]),
+            }
+            Row::new(cells)
         })
         .collect();
+
+    let width = 104;
+    let height = half as u16 + 2;
+    let area = centred(frame.area(), width, height);
 
     // Cleared first: without it the list underneath shows through the gaps
     // between words and neither is readable.
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Table::new(rows, [Constraint::Length(13), Constraint::Fill(1)])
-            .block(
-                Block::bordered()
-                    .border_style(Style::default().fg(paint::FOCUS))
-                    .padding(Padding::horizontal(1))
-                    .title(Span::styled(
-                        " Keys ",
-                        Style::default()
-                            .fg(paint::FOCUS)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .title_bottom(Span::styled(
-                        " ? or esc to close ",
-                        Style::default().fg(paint::MUTED),
-                    )),
-            )
-            .column_spacing(2),
+        Table::new(
+            rows,
+            [
+                Constraint::Length(13),
+                Constraint::Fill(1),
+                Constraint::Length(7),
+                Constraint::Fill(1),
+            ],
+        )
+        .block(
+            Block::bordered()
+                .border_style(Style::default().fg(paint::FOCUS))
+                .padding(Padding::horizontal(1))
+                .title(Span::styled(
+                    " Keys ",
+                    Style::default()
+                        .fg(paint::FOCUS)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .title_bottom(Span::styled(
+                    " ? or esc to close ",
+                    Style::default().fg(paint::MUTED),
+                )),
+        )
+        .column_spacing(2),
         area,
     );
 }
@@ -1366,6 +1448,69 @@ mod tests {
 
         let footer = lines(&drawn(&mut dashboard, 140, 20)).pop().unwrap();
         assert!(footer.contains("kill node.exe"), "got {footer:?}");
+    }
+
+    #[test]
+    fn what_is_typed_appears_on_the_status_line_and_comes_back_on_enter() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.ask_for("database to export");
+
+        for c in "shop_db".chars() {
+            dashboard.type_char(c);
+        }
+        dashboard.backspace();
+
+        let footer = lines(&drawn(&mut dashboard, 140, 20)).pop().unwrap();
+        assert!(footer.contains("database to export"), "got {footer:?}");
+        assert!(footer.contains("shop_d"), "what has been typed so far");
+
+        assert_eq!(dashboard.take_typed(), Some("shop_d".to_string()));
+        assert!(
+            dashboard.prompting().is_none(),
+            "taking the answer closes the prompt"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_prompt_yields_nothing_at_all() {
+        let mut dashboard = Dashboard::new();
+        dashboard.ask_for("database to export");
+        dashboard.type_char('x');
+        dashboard.cancel_prompt();
+
+        assert!(dashboard.prompting().is_none());
+        assert_eq!(
+            dashboard.take_typed(),
+            None,
+            "a cancelled prompt must not hand back what was half typed"
+        );
+    }
+
+    #[test]
+    fn an_arriving_notice_cannot_overwrite_what_is_being_typed() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.ask_for("database to export");
+        dashboard.type_char('s');
+        dashboard.apply(Update::Notice(Notice::done("rereading services")));
+
+        let footer = lines(&drawn(&mut dashboard, 140, 20)).pop().unwrap();
+        assert!(
+            footer.contains("database to export"),
+            "a collector must not take the line from under a half typed answer; got {footer:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_is_still_an_answer_the_caller_can_refuse() {
+        let mut dashboard = Dashboard::new();
+        dashboard.ask_for("database to export");
+        assert_eq!(
+            dashboard.take_typed(),
+            Some(String::new()),
+            "enter on an empty prompt is a decision, not a cancellation"
+        );
     }
 
     #[test]
