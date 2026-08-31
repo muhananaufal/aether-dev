@@ -42,7 +42,7 @@ impl Stack {
 /// Git state of one working tree. `branch` is `None` when the directory is not
 /// a repository at all, which is a different thing from a repository with no
 /// commits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitStatus {
     pub branch: Option<String>,
     pub modified: usize,
@@ -83,7 +83,7 @@ impl GitStatus {
 }
 
 /// One directory recognised as a project.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Project {
     pub name: String,
     /// The directory the project was grouped under, when the root has one

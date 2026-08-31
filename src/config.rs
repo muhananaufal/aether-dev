@@ -3,12 +3,18 @@
 //! layout and could therefore never run on anyone else's.
 
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("config is not valid TOML: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("cannot read {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("invalid config: {field} {reason}")]
     Invalid {
         field: &'static str,
@@ -95,6 +101,20 @@ impl Default for DockerConfig {
 }
 
 impl Config {
+    /// Reads configuration from `path`. With no path the defaults apply, which
+    /// is a working configuration rather than an error: the tool should start
+    /// before it is configured.
+    pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Self::from_toml_str(&text)
+    }
+
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
         let config: Config = toml::from_str(text)?;
         config.validate()?;
@@ -130,7 +150,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn an_empty_config_is_valid_and_yields_the_defaults() {
@@ -190,5 +210,42 @@ mod tests {
     fn an_unknown_key_is_rejected_so_typos_do_not_pass_silently() {
         let err = Config::from_toml_str("[scan]\nworkerz = 4\n").unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+    }
+    #[test]
+    fn a_missing_config_file_is_an_error_that_names_the_path() {
+        let err = Config::load(Some(Path::new("no-such-config-9f2a1c4.toml"))).unwrap_err();
+        assert!(matches!(err, ConfigError::Io { .. }), "got {err:?}");
+        assert!(err.to_string().contains("no-such-config-9f2a1c4.toml"));
+    }
+
+    #[test]
+    fn asking_for_no_config_file_at_all_yields_the_defaults() {
+        assert_eq!(Config::load(None).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn a_config_file_is_read_from_disk_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aether.toml");
+        std::fs::write(
+            &path,
+            "[scan]
+workers = 3
+",
+        )
+        .unwrap();
+        assert_eq!(Config::load(Some(&path)).unwrap().scan.workers, 3);
+
+        std::fs::write(
+            &path,
+            "[scan]
+workers = 0
+",
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load(Some(&path)).unwrap_err(),
+            ConfigError::Invalid { .. }
+        ));
     }
 }
