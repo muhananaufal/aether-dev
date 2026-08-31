@@ -46,3 +46,29 @@ caddyfile = "Caddyfile"
 
 # The source of truth for local hostnames. Managed with `adev domains`.
 domains = "domains.toml"
+
+# Toolchain versions, for projects that are not in containers.
+#
+# Nothing is discovered by convention: name the directories your versions live
+# in. A subdirectory counts as an install when its name contains a version and
+# it actually holds the binary.
+#
+# [toolchain.php]
+# search = ["C:/ProgramData/php"]
+# binary = "php.exe"
+#
+# [toolchain.node]
+# search = ["C:/Users/you/AppData/Local/nvm"]
+# binary = "node.exe"
+#
+# [toolchain.go]
+# search = ["C:/Go"]
+# binary = "go.exe"
+# bin_subdir = "bin"     # where the binary sits inside a version directory
+
+# Versions chosen by hand, for the legacy projects whose manifest says nothing
+# or says the wrong thing. A pin beats whatever the project declares, and a
+# bare version means that version - 7.4 is 7.4.x, not "7.4 or newer".
+#
+# [pin.old-billing]
+# php = "7.4"

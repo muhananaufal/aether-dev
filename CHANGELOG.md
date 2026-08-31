@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0 — unreleased
+
+### Toolchain versions
+
+- `env` / `exec` / `shell` — per-project toolchain versions, for the projects
+  that are not in containers. A machine holding PHP 7.4, 8.1, 8.2 and 8.3 side
+  by side runs each project on the one it asks for. A bare version means that
+  version: 7.4 is 7.4.x, not "7.4 or newer", which the semver crate would
+  otherwise read as a caret and answer with 8.3.
+
+Where the versions live is configuration, not convention. A pin beats what a
+manifest declares, and when nothing installed satisfies the constraint nothing
+is chosen: running a legacy project on an interpreter it said it cannot use,
+silently, is the failure this exists to prevent.
+
+
 ## 0.1.0 — unreleased
 
 First release. Replaces a 4,300-line PowerShell script that drove a WinForms
