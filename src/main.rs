@@ -2,7 +2,7 @@
 
 use aether_dev::cli::{Cli, Command, DbCommand, DomainCommand};
 use aether_dev::config::Config;
-use aether_dev::db::{dump_plan, restore_plan, Engine};
+use aether_dev::db::{backup_filename, dump_all_plan, dump_plan, restore_plan, Engine, ExecPlan};
 use aether_dev::docker::{probe_all, DockerClient, DockerError, HttpDockerClient};
 use aether_dev::domain::{Project, ServiceState, ServiceStatus};
 use aether_dev::git::GitCli;
@@ -499,6 +499,7 @@ fn db(config: &Config, command: DbCommand) -> ExitCode {
             gzip,
             force,
         } => export(config, &service, &database, &out, gzip, force),
+        DbCommand::Backup { out, gzip } => backup(config, &out, gzip),
         DbCommand::Import {
             service,
             database,
@@ -904,4 +905,139 @@ fn megabytes(bytes: Option<u64>) -> String {
         // measurement of nothing.
         None => "-".to_string(),
     }
+}
+
+/// A directory name that sorts chronologically and never collides with the
+/// last run. UTC rather than local time, because a backup taken across a
+/// daylight-saving change should still sort after the one before it.
+fn backup_directory_name() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "backup-{:04}{:02}{:02}-{:02}{:02}{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
+fn backup(config: &Config, out: &Path, gzip: bool) -> ExitCode {
+    let client = match docker_client(config) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let services = match client.services() {
+        Ok(services) => services,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let directory = out.join(backup_directory_name());
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        eprintln!("adev: cannot create {}: {error}", directory.display());
+        return ExitCode::from(2);
+    }
+
+    let started = Instant::now();
+    let mut written = 0usize;
+    let mut failed = false;
+
+    for service in &services {
+        if service.state != ServiceState::Running {
+            // Said out loud rather than skipped in silence: a backup that
+            // quietly leaves out a stopped database is the kind of gap nobody
+            // finds until they need the file.
+            outln!("skipped {} (not running)", service.service);
+            continue;
+        }
+        let detail = match client.inspect(&service.container) {
+            Ok(detail) => detail,
+            Err(error) => {
+                eprintln!("adev: {}: {error}", service.container);
+                failed = true;
+                continue;
+            }
+        };
+        let Some(engine) = Engine::from_image(&detail.image) else {
+            continue;
+        };
+        let plan = match dump_all_plan(engine, &detail.env) {
+            Ok(plan) => plan,
+            Err(error) => {
+                eprintln!("adev: {}: {error}", service.service);
+                failed = true;
+                continue;
+            }
+        };
+
+        let path = directory.join(backup_filename(&service.service, engine, gzip));
+        match dump_to_file(&client, &service.container, &plan, &path, gzip) {
+            Ok(bytes) => {
+                outln!("{} -> {} ({bytes} bytes)", service.service, path.display());
+                written += 1;
+            }
+            Err(reason) => {
+                let _ = std::fs::remove_file(&path);
+                eprintln!(
+                    "adev: {} failed, its file removed: {reason}",
+                    service.service
+                );
+                failed = true;
+            }
+        }
+    }
+
+    outln!(
+        "\n{written} dumps in {} in {:.2}s",
+        directory.display(),
+        started.elapsed().as_secs_f64()
+    );
+    if failed {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Runs one dump into one file. Shared by `db export` and `db backup` so the
+/// two cannot drift into handling a failed dump differently.
+fn dump_to_file(
+    client: &HttpDockerClient,
+    container: &str,
+    plan: &ExecPlan,
+    path: &Path,
+    gzip: bool,
+) -> Result<u64, String> {
+    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut sink = BufWriter::new(file);
+
+    let outcome = if gzip {
+        let mut encoder = GzEncoder::new(&mut sink, Compression::default());
+        client
+            .exec(container, &plan.command, &plan.env, &mut encoder)
+            .map_err(|error| error.to_string())
+            .and_then(|outcome| encoder.finish().map(|_| outcome).map_err(|e| e.to_string()))
+    } else {
+        client
+            .exec(container, &plan.command, &plan.env, &mut sink)
+            .map_err(|error| error.to_string())
+    }?;
+
+    sink.flush().map_err(|error| error.to_string())?;
+
+    if outcome.exit_code != 0 {
+        return Err(format!(
+            "{} exited {}: {}",
+            plan.command[0],
+            outcome.exit_code,
+            String::from_utf8_lossy(&outcome.stderr).trim()
+        ));
+    }
+    std::fs::metadata(path)
+        .map(|meta| meta.len())
+        .map_err(|error| error.to_string())
 }

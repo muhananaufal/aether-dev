@@ -106,6 +106,15 @@ pub enum DbCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Dump every database on every database service.
+    Backup {
+        /// Where to write. A timestamped directory is created inside it, so
+        /// one backup never overwrites another.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        #[arg(long)]
+        gzip: bool,
+    },
     /// Load a dump file into a database.
     Import {
         service: String,
@@ -393,6 +402,21 @@ mod tests {
                 json: false,
                 memory: true
             }
+        );
+    }
+
+    #[test]
+    fn a_backup_names_a_directory_rather_than_a_file() {
+        assert_eq!(
+            Cli::parse_from(["adev", "db", "backup", "--out", "backups"]).command,
+            Command::Db(DbCommand::Backup {
+                out: PathBuf::from("backups"),
+                gzip: false,
+            })
+        );
+        assert!(
+            Cli::try_parse_from(["adev", "db", "backup"]).is_err(),
+            "writing a backup somewhere the caller did not choose is not a default"
         );
     }
 }

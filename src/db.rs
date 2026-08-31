@@ -252,6 +252,91 @@ pub fn restore_plan(
     command.push(file.to_string());
     Ok(ExecPlan { command, env })
 }
+
+/// Builds a dump of every database on a server, which is what a backup wants:
+/// dumping one at a time would miss whatever was created since the list was
+/// last looked at.
+pub fn dump_all_plan(engine: Engine, container_env: &[String]) -> Result<ExecPlan, DbError> {
+    match engine {
+        Engine::MySql => {
+            let password = value_of(container_env, "MYSQL_ROOT_PASSWORD").ok_or(
+                DbError::MissingCredential {
+                    container: "mysql",
+                    variable: "MYSQL_ROOT_PASSWORD",
+                },
+            )?;
+            Ok(ExecPlan {
+                command: vec![
+                    "mysqldump".to_string(),
+                    "--user=root".to_string(),
+                    "--all-databases".to_string(),
+                    "--single-transaction".to_string(),
+                    "--routines".to_string(),
+                    "--triggers".to_string(),
+                    "--events".to_string(),
+                    "--set-gtid-purged=OFF".to_string(),
+                ],
+                env: vec![format!("MYSQL_PWD={password}")],
+            })
+        }
+        Engine::Postgres => {
+            let user =
+                value_of(container_env, "POSTGRES_USER").ok_or(DbError::MissingCredential {
+                    container: "postgres",
+                    variable: "POSTGRES_USER",
+                })?;
+            let password =
+                value_of(container_env, "POSTGRES_PASSWORD").ok_or(DbError::MissingCredential {
+                    container: "postgres",
+                    variable: "POSTGRES_PASSWORD",
+                })?;
+            Ok(ExecPlan {
+                // pg_dump takes one database. A backup of the server needs the
+                // other tool, which also carries roles and tablespaces.
+                command: vec!["pg_dumpall".to_string(), format!("--username={user}")],
+                env: vec![format!("PGPASSWORD={password}")],
+            })
+        }
+        Engine::Mongo => {
+            let user = value_of(container_env, "MONGO_INITDB_ROOT_USERNAME").ok_or(
+                DbError::MissingCredential {
+                    container: "mongo",
+                    variable: "MONGO_INITDB_ROOT_USERNAME",
+                },
+            )?;
+            let password = value_of(container_env, "MONGO_INITDB_ROOT_PASSWORD").ok_or(
+                DbError::MissingCredential {
+                    container: "mongo",
+                    variable: "MONGO_INITDB_ROOT_PASSWORD",
+                },
+            )?;
+            Ok(ExecPlan {
+                command: vec![
+                    "mongodump".to_string(),
+                    "--archive".to_string(),
+                    format!("--username={user}"),
+                    format!("--password={password}"),
+                    "--authenticationDatabase=admin".to_string(),
+                ],
+                env: Vec::new(),
+            })
+        }
+    }
+}
+
+/// Names a backup file after the service it came from, with the extension the
+/// contents actually have.
+pub fn backup_filename(service: &str, engine: Engine, gzip: bool) -> String {
+    let extension = match engine {
+        Engine::MySql | Engine::Postgres => "sql",
+        Engine::Mongo => "archive",
+    };
+    if gzip {
+        format!("{service}.{extension}.gz")
+    } else {
+        format!("{service}.{extension}")
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +515,59 @@ mod tests {
         assert!(
             matches!(err, DbError::MissingCredential { .. }),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_whole_server_dump_takes_every_database_not_just_one() {
+        let plan = dump_all_plan(Engine::MySql, &mysql_env()).unwrap();
+        assert!(plan.command.iter().any(|arg| arg == "--all-databases"));
+        assert!(plan.env.contains(&"MYSQL_PWD=s3cr3t".to_string()));
+    }
+
+    #[test]
+    fn postgres_uses_the_tool_that_covers_every_database() {
+        let plan = dump_all_plan(Engine::Postgres, &postgres_env()).unwrap();
+        assert_eq!(
+            plan.command[0], "pg_dumpall",
+            "pg_dump takes one database; a backup of the server needs the other tool"
+        );
+        assert!(plan.command.iter().any(|arg| arg == "--username=ticket"));
+        assert!(plan.env.contains(&"PGPASSWORD=p4ss".to_string()));
+    }
+
+    #[test]
+    fn a_whole_server_mongo_dump_names_no_database() {
+        let plan = dump_all_plan(Engine::Mongo, &mongo_env()).unwrap();
+        assert_eq!(plan.command[0], "mongodump");
+        assert!(
+            !plan.command.iter().any(|arg| arg.starts_with("--db=")),
+            "naming a database would dump only that one"
+        );
+        assert!(plan.command.iter().any(|arg| arg == "--archive"));
+    }
+
+    #[test]
+    fn a_whole_server_dump_still_needs_credentials() {
+        let err = dump_all_plan(Engine::MySql, &[]).unwrap_err();
+        assert!(
+            matches!(err, DbError::MissingCredential { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_backup_file_is_named_for_the_service_and_the_engine_it_came_from() {
+        assert_eq!(backup_filename("mysql", Engine::MySql, false), "mysql.sql");
+        assert_eq!(
+            backup_filename("mysql", Engine::MySql, true),
+            "mysql.sql.gz"
+        );
+        assert_eq!(backup_filename("pg", Engine::Postgres, false), "pg.sql");
+        assert_eq!(
+            backup_filename("m", Engine::Mongo, false),
+            "m.archive",
+            "a mongo dump is not sql and should not pretend to be"
         );
     }
 }
