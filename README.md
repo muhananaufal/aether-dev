@@ -126,13 +126,31 @@ own row, so coming back to a list finds it where you left it.
 Rescanning every repository to find out whether a container came back up is a
 wait nobody asked for, so the quick answer does not queue behind the slow one.
 
-It acts as well as shows. `s`, `x` and `S` start, stop and restart the selected
-service, `o` opens its page or its port, `b` dumps its databases, and `e` opens
-the selected project's folder — those finish without taking the screen, running
-on their own threads so the drawing never waits on them. `enter` runs the
-selected project and `t` opens a shell in it; those close the dashboard first,
-because a dev server and a redraw loop fighting over the terminal would garble
-both.
+The dashboard is a peer of the command line, not a window onto part of it:
+everything `adev` can do, it can do.
+
+`s`, `x` and `S` start, stop and restart the selected service, `o` opens
+whatever the focused row serves, `b` dumps its databases, `e` opens the
+selected project's folder, `v` shows which toolchain versions it resolves to,
+and `d` lists the routed hostnames. Those finish without taking the screen,
+running on their own threads so the drawing never waits on them.
+
+`E`, `I`, `.`, `A` and `X` need something typed — a database, a dump file, a
+hostname — and ask for it on the status line. A prompt takes every key while it
+is open, so `j` lands in what is being typed rather than moving a list behind
+it, and an arriving notice cannot take the line out from under a half-typed
+answer. `.` shows the project's `.env` variants while you type which one to
+switch to, because nobody remembers the exact spelling of all of them.
+
+`enter` runs the selected project, `t` opens a shell in it, and `:` runs one
+command in it. Those close the dashboard first, because a dev server and a
+redraw loop fighting over the terminal would garble both.
+
+Two things ask before they act, and only those two: `K`, which ends whatever
+holds the selected port, and `I`, which replaces a database with a dump. Only
+an explicit `y` goes ahead — any other key, including a stray arrow, is a no.
+Everything else either reverses or only creates, and asking about those would
+teach the habit of pressing `y` without reading.
 
 The footer carries two numbers about the container host: how much memory is in
 use inside the machine docker runs in, and what that machine costs this one.
@@ -357,8 +375,8 @@ reports.
   failing with a daemon error.
 - `--memory` costs about a second and a half per container, which is why the
   listing does not include it by default.
-- The dashboard can dump a service's databases but not load one back: import
-  needs a file path and a database name, and there is nowhere to type yet.
+- The dashboard's prompt is one line of plain text: no history, no completion,
+  and no file picker. A dump file is typed as a path.
 - Not carried over from the predecessor, deliberately: ejecting a drive, and
   the buttons for one particular editor. Those were buttons because the old
   tool was a window and knew one machine's layout.
