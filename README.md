@@ -61,6 +61,7 @@ adev db backup --out <dir> [--gzip]   every database on every running service
 adev domains    list
 adev domains    add <host> <container:port> [--no-reload]
 adev domains    remove <host> [--no-reload]
+adev run <project> [--print]          start it, on its own toolchain
 adev env <project>                    which toolchain versions it resolves to
 adev exec <project> -- <cmd...>       run a command with those in front on PATH
 adev shell <project> [--shell <s>]    a shell with those in front on PATH
@@ -93,6 +94,51 @@ keep a quieter marker so you can still see where you were. Colour carries the
 same distinction the words do — green for ready, yellow for starting, grey for
 stopped, and modified files told apart from untracked ones. Each frame shows
 its own count, and a scrollbar appears only when a list is longer than fits.
+
+## Running a project
+
+`adev run <project>` starts a project the way its kind of project is started,
+with its own toolchain in front on PATH — so a Laravel 5.8 project boots on
+PHP 7.4 while the shell around it still has 8.2.
+
+```
+$ adev run sapta-web
+adev: php artisan serve · http://localhost:8000
+Laravel development server started: <http://127.0.0.1:8000>
+[...] PHP 7.4.33 Development Server (http://127.0.0.1:8000) started
+```
+
+`--print` says what would happen without doing it:
+
+```
+$ adev run sapta-web --print
+sapta-web  C:/Projects/devivace/sapta-web
+  recipe   laravel
+  command  php artisan serve
+  address  http://localhost:8000
+  php      7.4.0
+```
+
+The built-in recipes cover Laravel, CodeIgniter 3 and 4, Django, FastAPI,
+Next.js, Vite, plain Node, Go, Rust and plain Python. Marker order is
+deliberate: nearly every Laravel project carries a `package.json` for its
+assets, and starting npm there runs a bundler rather than the application.
+
+Replace a recipe for every project that uses it, or one project on its own:
+
+```toml
+[recipe.laravel]                  # everything Laravel
+command = "php artisan serve --host=0.0.0.0"
+port = 8001
+
+[run.old-billing]                 # just this one; beats the recipe
+command = "php -S localhost:9000 -t public"
+port = 9000
+```
+
+A project name beats a recipe name because it is more specific, and because a
+project can be called `laravel`. A directory that says nothing about how it
+starts gets an error naming the config key to add, not a guess.
 ## Toolchain versions
 
 Nothing is discovered by convention: you say where your versions live, and a

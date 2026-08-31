@@ -16,6 +16,17 @@ is chosen: running a legacy project on an interpreter it said it cannot use,
 silently, is the failure this exists to prevent.
 
 
+### Running projects
+
+- `adev run <project>` starts a project the way its kind of project is
+  started, with its own toolchain in front on PATH. Verified end to end: a
+  Laravel 5.8 project boots its dev server on PHP 7.4.33 and answers, while
+  the shell around it has PHP 8.2.
+- Recipes cover Laravel, CodeIgniter 3 and 4, Django, FastAPI, Next.js, Vite,
+  plain Node, Go, Rust and plain Python, and each can be replaced for a whole
+  kind of project or for one project alone. `--print` says what would run
+  without running it.
+
 ### Dashboard
 
 - All three lists are on screen at once rather than one tab at a time. The
