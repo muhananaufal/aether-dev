@@ -47,6 +47,31 @@ configuration file only needs the parts you want to change. Start from
 Paths inside the file resolve against the directory you run from, not against
 the file. That matters for `caddyfile` and `domains`, which are written to.
 
+
+## Settings
+
+Everything is configurable and nothing is guessed at runtime, so the question
+"where do I change this" needs an answer that is not "read the source".
+
+```
+adev config           what is in force, and which file it came from
+adev config --init    write a starter file describing this machine
+adev config --edit    open it in $EDITOR
+```
+
+`--init` writes only what it actually found — the PHP and Node directories that
+exist and hold installations, and `DOCKER_HOST` as it is set. A generated file
+that names a directory nobody has is worse than an empty one: it reads as a
+fact about the machine and sends the reader looking for a bug that is not
+there.
+
+`adev config` reports how many versions each configured toolchain path actually
+holds. A path that turns out to hold nothing looks identical to one that was
+never set until you see a zero beside it.
+
+Inside the dashboard, `g` shows the same thing. It is read-only there on
+purpose: the file carries comments explaining each choice, and rewriting it
+from a form would throw those away every time somebody changed a number.
 ## Commands
 
 ```
@@ -68,6 +93,7 @@ adev run <project> [--print]          start it, on its own toolchain
 adev env <project>                    which toolchain versions it resolves to
 adev exec <project> -- <cmd...>       run a command with those in front on PATH
 adev shell <project> [--shell <s>]    a shell with those in front on PATH
+adev config [--init|--edit]           settings, and where they live
 adev tui                              the dashboard
 ```
 
