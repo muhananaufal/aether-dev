@@ -3,6 +3,7 @@
 //! layout and could therefore never run on anyone else's.
 
 use crate::catalog::ServiceConfig;
+use crate::memory::MemoryConfig;
 use crate::open::OpenConfig;
 use crate::recipe::RunOverride;
 use crate::toolchain::ToolConfig;
@@ -54,6 +55,8 @@ pub struct Config {
     pub service: HashMap<String, ServiceConfig>,
     /// How this machine hands a URL or a directory to the rest of the desktop.
     pub open: OpenConfig,
+    /// What the container host costs this machine, shown in the footer.
+    pub memory: MemoryConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

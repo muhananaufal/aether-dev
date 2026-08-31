@@ -11,6 +11,7 @@ use aether_dev::domain::{Project, ServiceState, ServiceStatus};
 use aether_dev::dotenv;
 use aether_dev::git::GitCli;
 use aether_dev::listen;
+use aether_dev::memory;
 use aether_dev::open;
 use aether_dev::ports::ScanEvent;
 use aether_dev::ports::{collect, ProjectScanner};
@@ -265,6 +266,19 @@ fn services(config: &Config, json: bool, memory: bool) -> ExitCode {
     }
     let ready = services.iter().filter(|s| s.is_reachable()).count();
     outln!("\n{} services, {ready} ready", services.len());
+
+    // The same two numbers the dashboard keeps in its footer. Asked for with
+    // --memory, because both probes shell out and nobody wants that on a
+    // command they run in a loop.
+    if memory {
+        let reading = memory::read(&config.memory);
+        if let Some(bytes) = reading.guest_bytes {
+            outln!("{} in use where the containers run", megabytes(Some(bytes)));
+        }
+        if let Some((process, bytes)) = reading.host {
+            outln!("{} of this machine, as {process}", megabytes(Some(bytes)));
+        }
+    }
     ExitCode::SUCCESS
 }
 
@@ -439,10 +453,39 @@ fn spawn_service_collector(config: &Config, updates: Sender<Update>) {
     });
 }
 
+/// Re-reads what the container host costs, on its own timer.
+///
+/// The probes shell out and can be slow, so they get a thread rather than a
+/// place in the draw loop. It ends when the dashboard drops the receiving end,
+/// which is how every other collector here stops too.
+fn spawn_memory_poller(config: &Config, updates: Sender<Update>) {
+    let settings = config.memory.clone();
+    if settings.interval_secs == 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        let interval = Duration::from_secs(settings.interval_secs);
+        loop {
+            let reading = memory::read(&settings);
+            // A reading with nothing in it means neither probe applies to this
+            // machine. Polling on would spend a process every few seconds to
+            // learn the same thing again.
+            if reading.is_empty() {
+                break;
+            }
+            if updates.send(Update::Memory(reading)).is_err() {
+                break;
+            }
+            std::thread::sleep(interval);
+        }
+    });
+}
+
 fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
     let mut dashboard = Dashboard::new();
     let (updates, incoming) = mpsc::channel();
     spawn_collectors(config, updates.clone());
+    spawn_memory_poller(config, updates.clone());
     // Held so closing the view can unwind the reader, which is otherwise
     // blocked waiting for a line that may never come.
     let mut watching: Option<Arc<AtomicBool>> = None;

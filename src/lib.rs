@@ -15,6 +15,7 @@ pub mod dotenv;
 pub mod framework;
 pub mod git;
 pub mod listen;
+pub mod memory;
 pub mod open;
 pub mod ports;
 pub mod proxy;

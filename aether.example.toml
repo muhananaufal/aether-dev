@@ -129,3 +129,19 @@ domains = "domains.toml"
 # [open]
 # browser = ["firefox", "--new-window", "{}"]
 # file_manager = ["code", "{}"]
+
+# What the container host costs, shown in the dashboard footer and by
+# `adev services --memory`.
+#
+# Two different numbers on Windows: how much memory is in use inside the
+# machine docker runs in, and what that machine costs Windows. The second is
+# usually the one that explains a struggling laptop, and it cannot be seen from
+# inside. On native Linux docker there is no second number, so host_process is
+# empty there.
+#
+# The guest command's output is read the way `free -m` prints it.
+#
+# [memory]
+# interval_secs = 5              # 0 turns the footer numbers off entirely
+# guest = ["wsl", "-d", "Ubuntu", "-u", "root", "free", "-m"]
+# host_process = ["vmmemWSL", "vmmem"]
