@@ -14,6 +14,7 @@ pub mod framework;
 pub mod git;
 pub mod ports;
 pub mod proxy;
+pub mod recipe;
 pub mod scan;
 pub mod toolchain;
 pub mod tui;

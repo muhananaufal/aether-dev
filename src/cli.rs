@@ -82,6 +82,14 @@ pub enum Command {
         #[arg(long, short)]
         tail: Option<u32>,
     },
+    /// Start a project, with its own toolchain in front on PATH and the dev
+    /// command its kind of project uses.
+    Run {
+        project: String,
+        /// Say what would run, and on which port, without running it.
+        #[arg(long)]
+        print: bool,
+    },
     /// Show which toolchain versions a project resolves to, and why.
     Env { project: String },
     /// Run a command with the project's toolchain in front on PATH.
@@ -486,6 +494,28 @@ mod tests {
                 project: "old-shop".to_string(),
                 shell: Some("pwsh".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn a_project_can_be_started_or_only_described() {
+        assert_eq!(
+            Cli::parse_from(["adev", "run", "sapta-web"]).command,
+            Command::Run {
+                project: "sapta-web".to_string(),
+                print: false,
+            }
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "run", "sapta-web", "--print"]).command,
+            Command::Run {
+                project: "sapta-web".to_string(),
+                print: true,
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["adev", "run"]).is_err(),
+            "there is no sensible project to start when none was named"
         );
     }
 }

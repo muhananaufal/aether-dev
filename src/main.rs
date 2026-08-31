@@ -9,6 +9,7 @@ use aether_dev::git::GitCli;
 use aether_dev::ports::ScanEvent;
 use aether_dev::ports::{collect, ProjectScanner};
 use aether_dev::proxy::DomainSet;
+use aether_dev::recipe;
 use aether_dev::scan::FsProjectScanner;
 use aether_dev::toolchain::{self, Reason, Resolution};
 use aether_dev::tui::{Dashboard, Pane, Update};
@@ -79,6 +80,7 @@ fn main() -> ExitCode {
             follow,
             tail,
         } => logs(&config, &service, follow, tail),
+        Command::Run { project, print } => run(&config, &project, print),
         Command::Env { project } => env(&config, &project),
         Command::Exec { project, command } => exec(&config, &project, &command),
         Command::Shell {
@@ -1234,4 +1236,93 @@ fn default_shell() -> Option<String> {
         .ok()
         .or_else(|| std::env::var("ComSpec").ok())
         .filter(|shell| !shell.trim().is_empty())
+}
+
+/// The names of everything sitting directly in a project, which is what the
+/// recipes are recognised from.
+fn entries_in(path: &Path) -> Vec<String> {
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Runs `argv` inside a project with its toolchain in front on PATH.
+/// Shared by `exec` and `run` so the two cannot drift apart in how they set an
+/// environment up or in what they do with the child's exit code.
+fn run_with_toolchain(config: &Config, name: &str, path: &Path, argv: &[String]) -> ExitCode {
+    let resolved = toolchains_for(config, name, path);
+    let path_value = match path_with(&resolved) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+
+    let Some((program, arguments)) = argv.split_first() else {
+        eprintln!("adev: nothing to run");
+        return ExitCode::from(2);
+    };
+    let status = std::process::Command::new(program)
+        .args(arguments)
+        .env("PATH", &path_value)
+        .current_dir(path)
+        .status();
+
+    match status {
+        // The child's exit code is passed through rather than replaced: a
+        // wrapper that always exits 0 breaks every script that wraps it.
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(error) => {
+            eprintln!("adev: cannot run {program}: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run(config: &Config, project: &str, print: bool) -> ExitCode {
+    let (name, path) = match locate_project(config, project) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+
+    let entries = entries_in(&path);
+    let present: Vec<&str> = entries.iter().map(String::as_str).collect();
+    let Some(plan) = recipe::plan_for(&name, &present, &config.recipe, &config.run) else {
+        eprintln!(
+            "adev: nothing here says how {name} starts. Give it a command with \
+             [run.{name}] in the config."
+        );
+        return ExitCode::from(2);
+    };
+
+    if print {
+        outln!("{name}  {}", path.display());
+        outln!(
+            "  recipe   {}",
+            plan.recipe.unwrap_or("none, configured by hand")
+        );
+        outln!("  command  {}", plan.command);
+        match plan.port {
+            Some(port) => outln!("  address  http://localhost:{port}"),
+            None => outln!("  address  not known for this kind of project"),
+        }
+        for (tool, resolution) in toolchains_for(config, &name, &path) {
+            match &resolution.chosen {
+                Some(chosen) => outln!("  {:<8} {}", tool, chosen.version),
+                None => outln!("  {:<8} {}", tool, why(resolution.reason)),
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let argv = recipe::split(&plan.command);
+    if let Some(port) = plan.port {
+        // Printed before the child takes the terminal, because once a dev
+        // server owns stdout this line would never be seen.
+        eprintln!("adev: {} · http://localhost:{port}", plan.command);
+    }
+    run_with_toolchain(config, &name, &path, &argv)
 }

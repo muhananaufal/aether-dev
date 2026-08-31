@@ -2,6 +2,7 @@
 //! is a constant in the code: the previous tool hard-coded one machine's
 //! layout and could therefore never run on anyone else's.
 
+use crate::recipe::RunOverride;
 use crate::toolchain::ToolConfig;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -38,6 +39,12 @@ pub struct Config {
     /// Versions chosen by hand per project, for the legacy ones whose manifest
     /// says nothing about what they need.
     pub pin: HashMap<String, HashMap<String, String>>,
+    /// How to start a kind of project, replacing a built-in recipe for every
+    /// project that uses it.
+    pub recipe: HashMap<String, RunOverride>,
+    /// How to start one named project, which beats the recipe because it is
+    /// more specific — and because a project can be called `laravel`.
+    pub run: HashMap<String, RunOverride>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -168,6 +175,18 @@ impl Config {
                 field: "scan.workers",
                 reason: "must be at least 1",
             });
+        }
+        for (name, entry) in self.recipe.iter().chain(self.run.iter()) {
+            // An entry that says nothing changes nothing, and reads as though
+            // it did. Better to refuse it than to have somebody wonder why
+            // their override had no effect.
+            if entry.command.is_none() && entry.port.is_none() {
+                let _ = name;
+                return Err(ConfigError::Invalid {
+                    field: "run",
+                    reason: "must set a command, a port, or both",
+                });
+            }
         }
         for (name, tool) in &self.toolchain {
             // A tool with nowhere to look finds nothing, and finding nothing
@@ -469,5 +488,40 @@ container = \"\"
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nowhere").join("aether.toml");
         assert_eq!(discover(dir.path(), Some(&missing)), None);
+    }
+
+    #[test]
+    fn nothing_about_running_is_configured_by_default() {
+        assert!(Config::default().recipe.is_empty());
+        assert!(Config::default().run.is_empty());
+    }
+
+    #[test]
+    fn a_recipe_can_be_replaced_for_every_project_that_uses_it() {
+        let cfg = Config::from_toml_str(
+            "[recipe.laravel]\ncommand = \"php artisan serve --host=0.0.0.0\"\nport = 8001\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.recipe["laravel"].command.as_deref(),
+            Some("php artisan serve --host=0.0.0.0")
+        );
+        assert_eq!(cfg.recipe["laravel"].port, Some(8001));
+    }
+
+    #[test]
+    fn one_project_can_be_given_its_own_command() {
+        let cfg = Config::from_toml_str(
+            "[run.old-billing]\ncommand = \"php -S localhost:9000 -t public\"\nport = 9000\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.run["old-billing"].port, Some(9000));
+        assert!(cfg.recipe.is_empty(), "the two are separate on purpose");
+    }
+
+    #[test]
+    fn an_entry_that_changes_nothing_is_refused_rather_than_ignored() {
+        let err = Config::from_toml_str("[run.shop]\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
     }
 }
