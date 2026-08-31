@@ -1,7 +1,7 @@
 //! The `adev` command.
 
 use aether_dev::cli::{Cli, Command, DbCommand, DomainCommand};
-use aether_dev::config::Config;
+use aether_dev::config::{self, Config};
 use aether_dev::db::{backup_filename, dump_all_plan, dump_plan, restore_plan, Engine, ExecPlan};
 use aether_dev::docker::{probe_all, DockerClient, DockerError, HttpDockerClient};
 use aether_dev::domain::{Project, ServiceState, ServiceStatus};
@@ -39,9 +39,25 @@ macro_rules! outln {
     };
 }
 
+/// Where this machine keeps its own configuration, when nothing nearer exists.
+fn machine_config() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("aether-dev").join(config::CONFIG_NAME))
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let config = match Config::load(cli.config.as_deref()) {
+    // Named on the command line, else the nearest aether.toml, else this
+    // machine's own. Having to pass --config every time is the kind of
+    // friction that stops a tool being used at all.
+    let chosen = cli.config.clone().or_else(|| {
+        let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        config::discover(&here, machine_config().as_deref())
+    });
+    let config = match Config::load(chosen.as_deref()) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("adev: {error}");
