@@ -118,6 +118,36 @@ pub enum Update {
     },
 }
 
+/// One thing you can do to the row a menu was opened on.
+///
+/// It carries the key that does the same thing, and choosing it is the same as
+/// pressing that key. So the menu cannot drift from the shortcuts: there is one
+/// path through the code, and the list is a way of finding it rather than a
+/// second implementation of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuItem {
+    pub label: String,
+    pub key: char,
+}
+
+impl MenuItem {
+    pub fn new(label: impl Into<String>, key: char) -> Self {
+        Self {
+            label: label.into(),
+            key,
+        }
+    }
+}
+
+/// The actions available on the selected row, listed so nothing has to be
+/// remembered to reach them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Menu {
+    subject: String,
+    items: Vec<MenuItem>,
+    selected: usize,
+}
+
 /// A box laid over the screen: a list of labelled values with a title.
 ///
 /// The settings screen was the first of these and is now one of three, along
@@ -250,6 +280,10 @@ pub struct Dashboard {
     confirm: Option<String>,
     /// A line being typed: what it is for, and what has been typed so far.
     prompt: Option<(String, String)>,
+    /// The action list over the selected row. While it is open the lists
+    /// underneath are held still, so the row it was opened on is the row the
+    /// chosen action reaches.
+    menu: Option<Menu>,
     /// What the container host is costing this machine. Polled on its own
     /// timer, so a slow probe cannot hold up the rest of the screen.
     memory: memory::Reading,
@@ -281,6 +315,7 @@ impl Dashboard {
             detail: None,
             confirm: None,
             prompt: None,
+            menu: None,
             memory: memory::Reading::default(),
             ports: Vec::new(),
             ports_error: None,
@@ -293,6 +328,11 @@ impl Dashboard {
             Update::Memory(reading) => self.memory = reading,
             Update::ScanFailed { path, reason } => self.scan_failures.push((path, reason)),
             Update::ScanFinished { scanned } => self.scanned = Some(scanned),
+            // A menu is about one row. Replacing the list underneath it would
+            // move that row, or remove it, and the chosen action would land on
+            // whatever slid into its place. The refresh is dropped rather than
+            // queued: the next one is seconds away, and the menu is not.
+            Update::Services(_) | Update::Ports(_) if self.menu.is_some() => {}
             Update::Services(services) => {
                 self.services = services;
                 self.services_error = None;
@@ -368,6 +408,39 @@ impl Dashboard {
 
     pub fn showing_detail(&self) -> bool {
         self.detail.is_some()
+    }
+
+    /// Opens the list of what can be done to the selected row.
+    pub fn open_menu(&mut self, subject: impl Into<String>, items: Vec<MenuItem>) {
+        self.menu = Some(Menu {
+            subject: subject.into(),
+            items,
+            selected: 0,
+        });
+    }
+
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_some()
+    }
+
+    /// Moves within the menu, stopping at both ends. Wrapping around would put
+    /// the last action - often the destructive one - one keypress above the
+    /// first.
+    pub fn menu_move(&mut self, delta: isize) {
+        if let Some(menu) = self.menu.as_mut() {
+            let last = menu.items.len().saturating_sub(1) as isize;
+            menu.selected = (menu.selected as isize + delta).clamp(0, last) as usize;
+        }
+    }
+
+    /// Takes the key the chosen action carries, and closes the menu.
+    pub fn take_menu_choice(&mut self) -> Option<char> {
+        let menu = self.menu.take()?;
+        menu.items.get(menu.selected).map(|item| item.key)
+    }
+
+    pub fn close_menu(&mut self) {
+        self.menu = None;
     }
 
     /// Asks for a line of text: a database name, a file, a hostname.
@@ -540,8 +613,31 @@ impl Dashboard {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
 
         if body.width < SIDE_BY_SIDE_WIDTH {
-            // Too narrow to divide: show what has the focus, whole.
-            self.draw_pane(frame, self.focus, body);
+            // Too narrow to divide, so one pane fills it - but one pane with no
+            // sign of the other two reads as the whole tool. A strip along the
+            // top names all three and says which key reaches each.
+            let [strip, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(body);
+            // The status line has no room for the hints at this width, and the
+            // hint is the whole way in - so it rides on the strip instead,
+            // which has space to spare.
+            let [names, hint] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(26)]).areas(strip);
+            frame.render_widget(pane_strip(self.focus), names);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "enter",
+                        Style::default()
+                            .fg(paint::FOCUS)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" what you can do ", Style::default().fg(paint::FRAME)),
+                ]))
+                .alignment(Alignment::Right),
+                hint,
+            );
+            self.draw_pane(frame, self.focus, rest);
         } else {
             let [left, right] =
                 Layout::horizontal([Constraint::Fill(3), Constraint::Fill(2)]).areas(body);
@@ -558,7 +654,7 @@ impl Dashboard {
         // hints are the half that goes.
         if status.width >= 90 {
             let [summary, keys] =
-                Layout::horizontal([Constraint::Fill(1), Constraint::Length(44)]).areas(status);
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(48)]).areas(status);
             frame.render_widget(self.status_line(), summary);
             frame.render_widget(key_hints(), keys);
         } else {
@@ -573,6 +669,9 @@ impl Dashboard {
     fn draw_overlays(&self, frame: &mut Frame) {
         if let Some(detail) = &self.detail {
             draw_detail(frame, detail);
+        }
+        if let Some(menu) = &self.menu {
+            draw_menu(frame, menu);
         }
         if self.help {
             draw_help(frame);
@@ -878,13 +977,14 @@ fn human_bytes(bytes: u64) -> String {
 /// Every key, on request. The status line has room for two of them, and a
 /// dashboard with a dozen actions cannot teach them from a strip of text.
 const KEYS: &[(&str, &str)] = &[
+    ("enter", "what you can do with the selected row"),
     ("tab / 1 2 3", "move between panes"),
     ("j k  ↑ ↓", "move within a pane"),
     ("s", "start the selected service"),
     ("x", "stop it"),
     ("S", "restart it"),
     ("o", "open whatever the focused row serves"),
-    ("enter", "run the selected project"),
+    ("p", "run the selected project"),
     ("l", "read the selected service's log"),
     ("t", "open a shell in a project, on its own toolchain"),
     ("e", "open the selected project's folder"),
@@ -919,11 +1019,53 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// The keys, kept to the right so the numbers on the left are read first.
+/// Names all three panes on a terminal too narrow to show them at once, so the
+/// two that are hidden are visibly hidden rather than absent.
+fn pane_strip(focused: Pane) -> Paragraph<'static> {
+    let mut spans = Vec::new();
+    for (index, pane) in Pane::ALL.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ", Style::default()));
+        }
+        let style = if *pane == focused {
+            Style::default()
+                .fg(paint::FOCUS)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(paint::MUTED)
+        };
+        spans.push(Span::styled(
+            format!(" {} {} ", index + 1, pane.title()),
+            style,
+        ));
+    }
+    Paragraph::new(Line::from(spans))
+}
+
+/// The way in, said in words rather than in keys.
+///
+/// The old line named three keys and assumed you would go and learn the rest.
+/// This one names the one thing that leads to everything else, so a dashboard
+/// somebody opens for the first time tells them what to press.
 fn key_hints() -> Paragraph<'static> {
-    Paragraph::new(Line::from(Span::styled(
-        "? keys · r refresh · q quit ",
-        Style::default().fg(paint::FRAME),
-    )))
+    Paragraph::new(Line::from(vec![
+        Span::styled(
+            "enter",
+            Style::default()
+                .fg(paint::FOCUS)
+                .add_modifier(Modifier::BOLD),
+        ),
+        // What the menu is about is named in the menu's own title, so this
+        // stays short enough to fit beside the counts.
+        Span::styled(
+            " what you can do here · ",
+            Style::default().fg(paint::FRAME),
+        ),
+        Span::styled("?", Style::default().fg(paint::FOCUS)),
+        Span::styled(" keys · ", Style::default().fg(paint::FRAME)),
+        Span::styled("q", Style::default().fg(paint::FOCUS)),
+        Span::styled(" quit ", Style::default().fg(paint::FRAME)),
+    ]))
     .alignment(Alignment::Right)
 }
 
@@ -1061,6 +1203,57 @@ fn draw_detail(frame: &mut Frame, detail: &Detail) {
 }
 
 /// Draws the key list over whatever is behind it.
+/// Draws the actions available on the selected row.
+///
+/// The key that does each one is shown beside it, so somebody who never wants
+/// to learn the keys never has to, and somebody who does learns them by using
+/// the menu rather than by reading a list.
+fn draw_menu(frame: &mut Frame, menu: &Menu) {
+    let width = 52;
+    let height = (menu.items.len() as u16 + 2).min(frame.area().height);
+    let area = centred(frame.area(), width, height);
+
+    let rows: Vec<Row<'static>> = menu
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let chosen = index == menu.selected;
+            let label = Style::default();
+            Row::new(vec![
+                Cell::from(item.label.clone()).style(if chosen {
+                    label.add_modifier(Modifier::REVERSED)
+                } else {
+                    label
+                }),
+                Cell::from(item.key.to_string()).style(Style::default().fg(paint::MUTED)),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Table::new(rows, [Constraint::Fill(1), Constraint::Length(3)])
+            .block(
+                Block::bordered()
+                    .border_style(Style::default().fg(paint::FOCUS))
+                    .padding(Padding::horizontal(1))
+                    .title(Span::styled(
+                        format!(" {} ", menu.subject),
+                        Style::default()
+                            .fg(paint::FOCUS)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .title_bottom(Span::styled(
+                        " enter to do it · esc to close ",
+                        Style::default().fg(paint::MUTED),
+                    )),
+            )
+            .column_spacing(2),
+        area,
+    );
+}
+
 fn draw_help(frame: &mut Frame) {
     // Two columns, because one is now taller than a 24-row terminal and a key
     // list that scrolls off the screen is not a key list.
@@ -1514,6 +1707,122 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_terminal_still_says_which_other_panes_exist() {
+        let mut dashboard = with_projects(3);
+        with_services(&mut dashboard);
+        dashboard.focus_on(Pane::Ports);
+
+        let view = screen(&drawn(&mut dashboard, 80, 24));
+        assert!(view.contains("Ports"), "the pane being shown");
+        assert!(
+            view.contains("Projects") && view.contains("Services"),
+            "one pane with no sign of the other two reads as the whole tool; got {view}"
+        );
+        assert!(
+            view.contains("what you can do"),
+            "the status line has no room for the hint at this width, so it has to be \
+             somewhere else - and this is the width the author's own terminal is; got {view}"
+        );
+    }
+
+    #[test]
+    fn the_status_line_says_what_enter_does() {
+        let mut dashboard = with_projects(1);
+        dashboard.apply(Update::Services(Vec::new()));
+        let view = screen(&drawn(&mut dashboard, 140, 20));
+        assert!(
+            view.contains("what you can do here"),
+            "the way in belongs on screen, not in a key list; got {view}"
+        );
+    }
+
+    fn menu_items() -> Vec<MenuItem> {
+        vec![
+            MenuItem::new("start it", 's'),
+            MenuItem::new("stop it", 'x'),
+            MenuItem::new("read its log", 'l'),
+        ]
+    }
+
+    #[test]
+    fn the_menu_names_each_action_and_shows_the_key_that_does_it() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.open_menu("mysql", menu_items());
+
+        let view = screen(&drawn(&mut dashboard, 140, 24));
+        assert!(view.contains("start it"), "the action in words");
+        assert!(
+            view.contains('s'),
+            "and the key beside it, so the menu teaches instead of replacing"
+        );
+        assert!(view.contains("mysql"), "what the actions apply to");
+    }
+
+    #[test]
+    fn choosing_an_item_gives_back_the_key_it_carries() {
+        let mut dashboard = Dashboard::new();
+        dashboard.open_menu("mysql", menu_items());
+        dashboard.menu_move(1);
+        assert_eq!(dashboard.take_menu_choice(), Some('x'));
+        assert!(
+            !dashboard.menu_open(),
+            "choosing closes it, or the next key lands in a menu nobody meant to leave open"
+        );
+    }
+
+    #[test]
+    fn the_menu_selection_stops_at_both_ends() {
+        let mut dashboard = Dashboard::new();
+        dashboard.open_menu("mysql", menu_items());
+        dashboard.menu_move(-1);
+        assert_eq!(
+            dashboard.take_menu_choice(),
+            Some('s'),
+            "it cannot go above the first"
+        );
+
+        dashboard.open_menu("mysql", menu_items());
+        dashboard.menu_move(99);
+        assert_eq!(dashboard.take_menu_choice(), Some('l'), "nor past the last");
+    }
+
+    #[test]
+    fn closing_the_menu_chooses_nothing() {
+        let mut dashboard = Dashboard::new();
+        dashboard.open_menu("mysql", menu_items());
+        dashboard.close_menu();
+        assert!(!dashboard.menu_open());
+        assert_eq!(dashboard.take_menu_choice(), None);
+    }
+
+    #[test]
+    fn a_refresh_cannot_move_the_row_a_menu_is_about() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::Services(vec![
+            service("mysql", 3306, true),
+            service("redis", 6379, true),
+        ]));
+        dashboard.focus_on(Pane::Services);
+        dashboard.move_selection(1);
+        assert_eq!(
+            dashboard.selected_service().map(|s| s.service.as_str()),
+            Some("redis")
+        );
+
+        dashboard.open_menu("redis", menu_items());
+        // The collector replaces the whole list. Without a guard the row under
+        // the cursor becomes a different service, and the action lands on it.
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+
+        assert_eq!(
+            dashboard.selected_service().map(|s| s.service.as_str()),
+            Some("redis"),
+            "an action chosen from a menu must reach the row the menu was opened on"
+        );
+    }
+
+    #[test]
     fn a_detail_overlay_carries_its_own_title_and_lines() {
         let mut dashboard = Dashboard::new();
         dashboard.apply(Update::ScanFinished { scanned: 0 });
@@ -1568,8 +1877,10 @@ mod tests {
 
         let narrow = screen(&drawn(&mut dashboard, 70, 20));
         assert!(narrow.contains("Projects"));
+        // The strip along the top names all three panes now, so the name alone
+        // proves nothing. What must be absent is the other pane's contents.
         assert!(
-            !narrow.contains("Services"),
+            !narrow.contains("mysql"),
             "three panes on a 70 column terminal are three unreadable columns"
         );
 
