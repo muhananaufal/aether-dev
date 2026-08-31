@@ -86,6 +86,40 @@ pub fn merge(
     merged
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum CatalogError {
+    #[error("service {service} names a domain but no port, so nothing could be routed to it")]
+    DomainWithoutPort { service: String },
+}
+
+/// The routes the declared services ask for.
+///
+/// The upstream is the container rather than localhost: the proxy runs beside
+/// them on docker's own network, where the container name is the address and
+/// which port was published to this machine does not come into it.
+pub fn service_domains(
+    declared: &[(String, ServiceConfig)],
+) -> Result<Vec<(String, String)>, CatalogError> {
+    let mut routes = Vec::new();
+    for (name, settings) in declared {
+        let Some(host) = &settings.domain else {
+            continue;
+        };
+        // A hostname with nothing behind it generates a route to nowhere,
+        // which only fails later, at request time, with nothing to point at.
+        let port = settings
+            .port
+            .ok_or_else(|| CatalogError::DomainWithoutPort {
+                service: name.clone(),
+            })?;
+        routes.push((
+            host.clone(),
+            format!("{}:{port}", settings.container_for(name)),
+        ));
+    }
+    Ok(routes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +242,55 @@ mod tests {
             ..ServiceConfig::default()
         };
         assert_eq!(named.container_for("redis"), "redis-db");
+    }
+
+    #[test]
+    fn a_service_that_names_a_domain_asks_for_a_route_to_its_container() {
+        let routes = service_domains(&declared(&[(
+            "dbgate",
+            ServiceConfig {
+                container: Some("dbgate-ui".to_string()),
+                port: Some(19000),
+                domain: Some("db.test".to_string()),
+                ..ServiceConfig::default()
+            },
+        )]))
+        .unwrap();
+        assert_eq!(
+            routes,
+            vec![("db.test".to_string(), "dbgate-ui:19000".to_string())],
+            "the proxy sits on docker's network, where the container is the address"
+        );
+    }
+
+    #[test]
+    fn a_service_with_no_domain_asks_for_no_route() {
+        let routes = service_domains(&declared(&[(
+            "mysql",
+            ServiceConfig {
+                port: Some(3306),
+                ..ServiceConfig::default()
+            },
+        )]))
+        .unwrap();
+        assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn a_domain_with_no_port_behind_it_is_refused_by_name() {
+        let err = service_domains(&declared(&[(
+            "mailpit",
+            ServiceConfig {
+                domain: Some("mail.test".to_string()),
+                ..ServiceConfig::default()
+            },
+        )]))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("mailpit"),
+            "a route to nowhere fails at request time, far from the config that caused it; \
+             got {err}"
+        );
     }
 
     #[test]

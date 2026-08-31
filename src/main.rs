@@ -689,7 +689,39 @@ fn load_domains(path: &Path) -> Result<DomainSet, ExitCode> {
 /// Writes the source of truth first, then the file generated from it. In that
 /// order a crash in between leaves the record of intent intact and the proxy
 /// serving what it served before, rather than the other way round.
+/// Every route the proxy should serve: the ones in the domains file, plus the
+/// ones the declared services ask for.
+///
+/// The two are merged here rather than in the file, so a service's hostname
+/// stays a fact about that service instead of being copied into an artefact
+/// that would then disagree with it. A host claimed by both is refused, which
+/// is the same answer the file gives when it names one host twice.
+fn all_routes(config: &Config, set: &DomainSet) -> Result<DomainSet, ExitCode> {
+    let declared = catalog::service_domains(&config.services_declared()).map_err(|error| {
+        eprintln!("adev: {error}");
+        ExitCode::from(2)
+    })?;
+
+    let mut merged = set.clone();
+    for (host, upstream) in declared {
+        if let Err(error) = merged.add(&host, &upstream) {
+            eprintln!(
+                "adev: {error} — {host} is named both by a service and in {}",
+                config.caddy.domains.display()
+            );
+            return Err(ExitCode::from(2));
+        }
+    }
+    Ok(merged)
+}
+
 fn save_domains(config: &Config, set: &DomainSet, no_reload: bool) -> ExitCode {
+    let routes = match all_routes(config, set) {
+        Ok(routes) => routes,
+        Err(code) => return code,
+    };
+    // The file keeps only what was edited through it. What the services ask
+    // for is written into the generated config and nowhere else.
     if let Err(error) = std::fs::write(&config.caddy.domains, set.to_toml_string()) {
         eprintln!(
             "adev: cannot write {}: {error}",
@@ -697,7 +729,7 @@ fn save_domains(config: &Config, set: &DomainSet, no_reload: bool) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    if let Err(error) = std::fs::write(&config.caddy.caddyfile, set.to_caddyfile()) {
+    if let Err(error) = std::fs::write(&config.caddy.caddyfile, routes.to_caddyfile()) {
         eprintln!(
             "adev: cannot write {}: {error}",
             config.caddy.caddyfile.display()
@@ -737,14 +769,29 @@ fn domains(config: &Config, command: DomainCommand) -> ExitCode {
 
     match command {
         DomainCommand::List => {
-            for domain in set.entries() {
-                outln!("{:<30} -> {}", clip(&domain.host, 30), domain.upstream);
+            let routes = match all_routes(config, &set) {
+                Ok(routes) => routes,
+                Err(code) => return code,
+            };
+            let from_file: Vec<&str> = set.entries().iter().map(|d| d.host.as_str()).collect();
+            for domain in routes.entries() {
+                // Which of the two named it decides where to go to change it.
+                let source = if from_file.contains(&domain.host.as_str()) {
+                    ""
+                } else {
+                    "  (from its service)"
+                };
+                outln!(
+                    "{:<30} -> {}{source}",
+                    clip(&domain.host, 30),
+                    domain.upstream
+                );
             }
             // Saying where the answer came from matters when the answer is
             // empty: an unconfigured file and no routes look the same.
             outln!(
-                "\n{} routed, from {}",
-                set.entries().len(),
+                "\n{} routed, from {} and the declared services",
+                routes.entries().len(),
                 config.caddy.domains.display()
             );
             ExitCode::SUCCESS
