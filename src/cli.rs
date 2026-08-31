@@ -82,6 +82,24 @@ pub enum Command {
         #[arg(long, short)]
         tail: Option<u32>,
     },
+    /// Show which toolchain versions a project resolves to, and why.
+    Env { project: String },
+    /// Run a command with the project's toolchain in front on PATH.
+    Exec {
+        project: String,
+        /// Everything after `--`. Taken whole so the command's own flags are
+        /// never mistaken for this tool's.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Start a shell with the project's toolchain in front on PATH.
+    Shell {
+        project: String,
+        /// Which shell to start. Without this, SHELL is used on unix and
+        /// ComSpec on Windows.
+        #[arg(long)]
+        shell: Option<String>,
+    },
     /// Open the interactive dashboard.
     Tui,
 }
@@ -417,6 +435,57 @@ mod tests {
         assert!(
             Cli::try_parse_from(["adev", "db", "backup"]).is_err(),
             "writing a backup somewhere the caller did not choose is not a default"
+        );
+    }
+
+    #[test]
+    fn a_project_can_be_asked_what_toolchain_it_resolves_to() {
+        assert_eq!(
+            Cli::parse_from(["adev", "env", "legacy-billing"]).command,
+            Command::Env {
+                project: "legacy-billing".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_command_runs_after_a_separator_so_its_own_flags_are_left_alone() {
+        let cli = Cli::parse_from(["adev", "exec", "old-shop", "--", "php", "-v"]);
+        assert_eq!(
+            cli.command,
+            Command::Exec {
+                project: "old-shop".to_string(),
+                command: vec!["php".to_string(), "-v".to_string()],
+            }
+        );
+
+        let with_flags = Cli::parse_from(["adev", "exec", "old-shop", "--", "php", "--version"]);
+        assert!(
+            matches!(with_flags.command, Command::Exec { .. }),
+            "--version belongs to php, not to adev"
+        );
+    }
+
+    #[test]
+    fn exec_without_a_command_is_refused_rather_than_running_nothing() {
+        assert!(Cli::try_parse_from(["adev", "exec", "old-shop"]).is_err());
+    }
+
+    #[test]
+    fn a_shell_can_be_named_when_the_environment_does_not_say() {
+        assert_eq!(
+            Cli::parse_from(["adev", "shell", "old-shop"]).command,
+            Command::Shell {
+                project: "old-shop".to_string(),
+                shell: None,
+            }
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "shell", "old-shop", "--shell", "pwsh"]).command,
+            Command::Shell {
+                project: "old-shop".to_string(),
+                shell: Some("pwsh".to_string()),
+            }
         );
     }
 }

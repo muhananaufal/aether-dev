@@ -10,6 +10,7 @@ use aether_dev::ports::ScanEvent;
 use aether_dev::ports::{collect, ProjectScanner};
 use aether_dev::proxy::DomainSet;
 use aether_dev::scan::FsProjectScanner;
+use aether_dev::toolchain::{self, Reason, Resolution};
 use aether_dev::tui::{Dashboard, Tab, Update};
 use clap::Parser;
 use flate2::read::GzDecoder;
@@ -62,6 +63,12 @@ fn main() -> ExitCode {
             follow,
             tail,
         } => logs(&config, &service, follow, tail),
+        Command::Env { project } => env(&config, &project),
+        Command::Exec { project, command } => exec(&config, &project, &command),
+        Command::Shell {
+            project,
+            shell: named,
+        } => shell(&config, &project, named.as_deref()),
         Command::Tui => tui(&config),
     }
 }
@@ -1012,4 +1019,206 @@ fn dump_to_file(
     // Warnings are not failures, but they are not nothing either, so they
     // travel back rather than being swallowed here.
     Ok((bytes, outcome.stderr))
+}
+
+/// Finds a project by name, or takes a path directly when one is given.
+fn locate_project(config: &Config, wanted: &str) -> Result<(String, PathBuf), ExitCode> {
+    let direct = Path::new(wanted);
+    if direct.is_dir() {
+        let name = direct
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| wanted.to_string());
+        return Ok((name, direct.to_path_buf()));
+    }
+
+    let scanner =
+        FsProjectScanner::new(GitCli::new(config.scan.git_timeout_ms), config.scan.workers);
+    let (sender, receiver) = mpsc::channel();
+    let roots = config.project.clone();
+    std::thread::spawn(move || scanner.scan(&roots, sender));
+
+    collect(receiver)
+        .projects
+        .into_iter()
+        .find(|project| project.name == wanted)
+        .map(|project| (project.name, project.path))
+        .ok_or_else(|| {
+            eprintln!("adev: no project called {wanted:?} under the configured roots");
+            ExitCode::from(2)
+        })
+}
+
+/// Works out which version of each configured tool this project should use.
+///
+/// A tool is considered when the project was pinned to a version of it, or
+/// when the project carries the manifest that tool reads. Everything else is
+/// left alone: putting a Node on PATH for a project that never mentions Node
+/// would be this tool deciding something nobody asked it to.
+fn toolchains_for(config: &Config, name: &str, path: &Path) -> Vec<(String, Resolution)> {
+    let pins = config.pin.get(name);
+    let read = |file: &str| std::fs::read_to_string(path.join(file)).ok();
+    let composer = read("composer.json");
+    let package = read("package.json");
+
+    let mut resolved = Vec::new();
+    for (tool, settings) in &config.toolchain {
+        let pinned = pins.and_then(|pins| pins.get(tool)).map(String::as_str);
+        let declared = match tool.as_str() {
+            "php" => composer.as_deref().and_then(toolchain::wanted_php),
+            "node" => package.as_deref().and_then(toolchain::wanted_node),
+            _ => None,
+        };
+        let relevant = pinned.is_some()
+            || match tool.as_str() {
+                "php" => composer.is_some(),
+                "node" => package.is_some(),
+                _ => false,
+            };
+        if !relevant {
+            continue;
+        }
+
+        let installed = toolchain::discover(settings);
+        resolved.push((
+            tool.clone(),
+            toolchain::resolve(&installed, pinned, declared.as_deref()),
+        ));
+    }
+    resolved.sort_by(|a, b| a.0.cmp(&b.0));
+    resolved
+}
+
+fn why(reason: Reason) -> &'static str {
+    match reason {
+        Reason::Pinned => "pinned in config",
+        Reason::Declared => "asked for by the project",
+        Reason::Newest => "newest installed; the project asks for nothing",
+        Reason::NothingSatisfies => "NOTHING INSTALLED SATISFIES THIS",
+        Reason::NoneInstalled => "NO VERSION OF THIS TOOL WAS FOUND",
+    }
+}
+
+fn env(config: &Config, project: &str) -> ExitCode {
+    let (name, path) = match locate_project(config, project) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    let resolved = toolchains_for(config, &name, &path);
+
+    if resolved.is_empty() {
+        outln!(
+            "{name} resolves no toolchain. Either nothing is configured under \
+             [toolchain], or this project names none."
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    outln!("{name}  {}", path.display());
+    let mut unresolved = false;
+    for (tool, resolution) in &resolved {
+        match &resolution.chosen {
+            Some(chosen) => outln!(
+                "  {:<8} {:<24} {}\n           {}",
+                tool,
+                chosen.version.to_string(),
+                why(resolution.reason),
+                chosen.path.display()
+            ),
+            None => {
+                unresolved = true;
+                outln!(
+                    "  {:<8} {:<24} {} ({})",
+                    tool,
+                    "-",
+                    why(resolution.reason),
+                    resolution.constraint.as_deref().unwrap_or("no constraint")
+                );
+            }
+        }
+    }
+    // A resolution that found nothing is reported in the exit code too, so a
+    // script that sets up an environment can stop rather than carry on with
+    // whatever happened to be on PATH already.
+    if unresolved {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Builds a PATH with the project's toolchains in front of whatever was there.
+///
+/// In front rather than instead: a project needs its own PHP, but it still
+/// needs git, and the tools it shells out to.
+fn path_with(resolved: &[(String, Resolution)]) -> Result<std::ffi::OsString, ExitCode> {
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for (tool, resolution) in resolved {
+        match &resolution.chosen {
+            Some(chosen) => entries.push(chosen.path.clone()),
+            None => {
+                eprintln!(
+                    "adev: no usable {tool}: {} ({})",
+                    why(resolution.reason),
+                    resolution.constraint.as_deref().unwrap_or("no constraint")
+                );
+                return Err(ExitCode::from(2));
+            }
+        }
+    }
+    if let Some(existing) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(entries).map_err(|error| {
+        eprintln!("adev: cannot build a PATH: {error}");
+        ExitCode::from(2)
+    })
+}
+
+fn exec(config: &Config, project: &str, argv: &[String]) -> ExitCode {
+    let (name, path) = match locate_project(config, project) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    let resolved = toolchains_for(config, &name, &path);
+    let path_value = match path_with(&resolved) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+
+    let Some((program, arguments)) = argv.split_first() else {
+        eprintln!("adev: nothing to run");
+        return ExitCode::from(2);
+    };
+    let status = std::process::Command::new(program)
+        .args(arguments)
+        .env("PATH", &path_value)
+        .current_dir(&path)
+        .status();
+
+    match status {
+        // The child's exit code is passed through rather than replaced: a
+        // wrapper that always exits 0 breaks every script that wraps it.
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(error) => {
+            eprintln!("adev: cannot run {program}: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn shell(config: &Config, project: &str, shell: Option<&str>) -> ExitCode {
+    let program = shell.map(str::to_string).or_else(default_shell);
+    let Some(program) = program else {
+        eprintln!("adev: no shell to start; name one with --shell");
+        return ExitCode::from(2);
+    };
+    exec(config, project, &[program])
+}
+
+fn default_shell() -> Option<String> {
+    std::env::var("SHELL")
+        .ok()
+        .or_else(|| std::env::var("ComSpec").ok())
+        .filter(|shell| !shell.trim().is_empty())
 }

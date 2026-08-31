@@ -2,7 +2,9 @@
 //! is a constant in the code: the previous tool hard-coded one machine's
 //! layout and could therefore never run on anyone else's.
 
+use crate::toolchain::ToolConfig;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +31,13 @@ pub struct Config {
     pub scan: ScanConfig,
     pub docker: DockerConfig,
     pub caddy: CaddyConfig,
+    /// Where each tool's versions live. Empty by default: nobody can guess
+    /// where somebody installed their interpreters, and guessing wrong is how
+    /// the previous tool ended up blind to a version it did not know of.
+    pub toolchain: HashMap<String, ToolConfig>,
+    /// Versions chosen by hand per project, for the legacy ones whose manifest
+    /// says nothing about what they need.
+    pub pin: HashMap<String, HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -159,6 +168,23 @@ impl Config {
                 field: "scan.workers",
                 reason: "must be at least 1",
             });
+        }
+        for (name, tool) in &self.toolchain {
+            // A tool with nowhere to look finds nothing, and finding nothing
+            // looks exactly like having nothing installed. Say which it is.
+            if tool.search.is_empty() && tool.versions.is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "toolchain.search",
+                    reason: "must list a directory to look in, or name versions directly",
+                });
+            }
+            if tool.binary.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "toolchain.binary",
+                    reason: "must name the file that marks a directory as an install",
+                });
+            }
+            let _ = name;
         }
         if self.caddy.container.trim().is_empty() {
             return Err(ConfigError::Invalid {
@@ -312,5 +338,54 @@ container = \"\"
         )
         .unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn no_toolchain_is_configured_by_default_because_nobody_can_guess_where_they_live() {
+        assert!(Config::default().toolchain.is_empty());
+        assert!(Config::default().pin.is_empty());
+    }
+
+    #[test]
+    fn a_toolchain_names_where_to_look_and_what_to_look_for() {
+        let cfg = Config::from_toml_str(
+            "[toolchain.php]\nsearch = [\"C:/laragon/bin/php\"]\nbinary = \"php.exe\"\n",
+        )
+        .unwrap();
+        let php = cfg.toolchain.get("php").expect("php configured");
+        assert_eq!(php.search, vec![PathBuf::from("C:/laragon/bin/php")]);
+        assert_eq!(php.binary, "php.exe");
+        assert_eq!(php.bin_subdir, None);
+    }
+
+    #[test]
+    fn a_toolchain_whose_binary_lives_in_a_subdirectory_can_say_so() {
+        let cfg = Config::from_toml_str(
+            "[toolchain.go]\nsearch = [\"C:/Go\"]\nbinary = \"go.exe\"\nbin_subdir = \"bin\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.toolchain["go"].bin_subdir.as_deref(), Some("bin"));
+    }
+
+    #[test]
+    fn a_toolchain_with_nowhere_to_look_is_refused_rather_than_silently_finding_nothing() {
+        let err = Config::from_toml_str("[toolchain.php]\nbinary = \"php.exe\"\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_toolchain_that_does_not_say_what_binary_to_look_for_is_refused() {
+        let err = Config::from_toml_str("[toolchain.php]\nsearch = [\"C:/php\"]\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_project_can_be_pinned_when_its_manifest_says_nothing() {
+        let cfg = Config::from_toml_str(
+            "[pin.legacy-billing]\nphp = \"5.6\"\n\n[pin.old-shop]\nphp = \"7.2\"\nnode = \"10\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.pin["legacy-billing"]["php"], "5.6");
+        assert_eq!(cfg.pin["old-shop"]["node"], "10");
     }
 }
