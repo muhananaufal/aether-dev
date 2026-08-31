@@ -23,6 +23,11 @@ pub enum DockerError {
 
 pub trait DockerClient: Send + Sync {
     fn services(&self) -> Result<Vec<ServiceStatus>, DockerError>;
+
+    /// Restarts a container so it re-reads a config file that changed on disk.
+    /// A restart rather than a graceful reload: it is one request instead of an
+    /// exec session, and a local proxy blinking for a moment costs nothing.
+    fn restart(&self, container: &str) -> Result<(), DockerError>;
 }
 
 #[derive(Deserialize)]
@@ -174,6 +179,17 @@ impl DockerClient for HttpDockerClient {
             .map_err(|error| unreachable(error.to_string()))?;
 
         parse_containers(&body)
+    }
+
+    fn restart(&self, container: &str) -> Result<(), DockerError> {
+        let url = format!("{}/containers/{container}/restart", self.base);
+        ureq::post(&url)
+            .send_empty()
+            .map_err(|error| DockerError::Unreachable {
+                endpoint: self.base.clone(),
+                reason: error.to_string(),
+            })?;
+        Ok(())
     }
 }
 

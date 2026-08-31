@@ -81,10 +81,22 @@ pub enum DbCommand {
 pub enum DomainCommand {
     /// Show the configured hostnames and what they point at.
     List,
-    /// Route a hostname to a local address.
-    Add { name: String, target: String },
+    /// Route a hostname to a container inside the docker network.
+    Add {
+        /// Hostname to serve, such as db.localhost.
+        host: String,
+        /// Container and the port it listens on inside the network, written
+        /// as container:port. Not the port published to this machine.
+        upstream: String,
+        #[arg(long)]
+        no_reload: bool,
+    },
     /// Stop routing a hostname.
-    Remove { name: String },
+    Remove {
+        host: String,
+        #[arg(long)]
+        no_reload: bool,
+    },
 }
 
 #[cfg(test)]
@@ -179,14 +191,16 @@ mod tests {
         assert_eq!(
             Cli::parse_from(["adev", "domains", "add", "db.localhost", "localhost:19000"]).command,
             Command::Domains(DomainCommand::Add {
-                name: "db.localhost".to_string(),
-                target: "localhost:19000".to_string(),
+                host: "db.localhost".to_string(),
+                upstream: "localhost:19000".to_string(),
+                no_reload: false,
             })
         );
         assert_eq!(
             Cli::parse_from(["adev", "domains", "remove", "db.localhost"]).command,
             Command::Domains(DomainCommand::Remove {
-                name: "db.localhost".to_string()
+                host: "db.localhost".to_string(),
+                no_reload: false,
             })
         );
     }
@@ -209,6 +223,24 @@ mod tests {
         assert_eq!(
             Cli::parse_from(["adev", "scan", "--config", "a.toml"]).config,
             Some(PathBuf::from("a.toml"))
+        );
+    }
+    #[test]
+    fn a_domain_change_can_be_written_without_restarting_the_proxy() {
+        assert_eq!(
+            Cli::parse_from(["adev", "domains", "add", "db.localhost", "dbgate-ui:3000"]).command,
+            Command::Domains(DomainCommand::Add {
+                host: "db.localhost".to_string(),
+                upstream: "dbgate-ui:3000".to_string(),
+                no_reload: false,
+            })
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "domains", "remove", "db.localhost", "--no-reload"]).command,
+            Command::Domains(DomainCommand::Remove {
+                host: "db.localhost".to_string(),
+                no_reload: true,
+            })
         );
     }
 }

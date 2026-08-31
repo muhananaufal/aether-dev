@@ -1,19 +1,20 @@
 //! The `adev` command.
 
-use aether_dev::cli::{Cli, Command};
+use aether_dev::cli::{Cli, Command, DomainCommand};
 use aether_dev::config::Config;
 use aether_dev::docker::{probe_all, DockerClient, HttpDockerClient};
 use aether_dev::domain::{Project, ServiceStatus};
 use aether_dev::git::GitCli;
 use aether_dev::ports::ScanEvent;
 use aether_dev::ports::{collect, ProjectScanner};
+use aether_dev::proxy::DomainSet;
 use aether_dev::scan::FsProjectScanner;
 use aether_dev::tui::{Dashboard, Tab, Update};
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use serde::Serialize;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
@@ -48,7 +49,7 @@ fn main() -> ExitCode {
         Command::Services { json } => services(&config, json),
         Command::Ports { json } => ports(&config, json),
         Command::Db(_) => not_built_yet("db"),
-        Command::Domains(_) => not_built_yet("domains"),
+        Command::Domains(command) => domains(&config, command),
         Command::Tui => tui(&config),
     }
 }
@@ -345,6 +346,106 @@ fn tui(config: &Config) -> ExitCode {
         Err(error) => {
             eprintln!("adev: {error}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Reads the domains file. A file that is not there yet is an empty set, not a
+/// failure: nothing has been routed, which is a valid state to start from.
+fn load_domains(path: &Path) -> Result<DomainSet, ExitCode> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => DomainSet::from_toml_str(&text).map_err(|error| {
+            eprintln!("adev: {}: {error}", path.display());
+            ExitCode::from(2)
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DomainSet::default()),
+        Err(error) => {
+            eprintln!("adev: cannot read {}: {error}", path.display());
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// Writes the source of truth first, then the file generated from it. In that
+/// order a crash in between leaves the record of intent intact and the proxy
+/// serving what it served before, rather than the other way round.
+fn save_domains(config: &Config, set: &DomainSet, no_reload: bool) -> ExitCode {
+    if let Err(error) = std::fs::write(&config.caddy.domains, set.to_toml_string()) {
+        eprintln!(
+            "adev: cannot write {}: {error}",
+            config.caddy.domains.display()
+        );
+        return ExitCode::from(2);
+    }
+    if let Err(error) = std::fs::write(&config.caddy.caddyfile, set.to_caddyfile()) {
+        eprintln!(
+            "adev: cannot write {}: {error}",
+            config.caddy.caddyfile.display()
+        );
+        return ExitCode::from(2);
+    }
+
+    if no_reload {
+        outln!(
+            "wrote {} and {}; the proxy still serves the previous config until it restarts",
+            config.caddy.domains.display(),
+            config.caddy.caddyfile.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let client = match docker_client(config) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    if let Err(error) = client.restart(&config.caddy.container) {
+        eprintln!(
+            "adev: wrote the config but could not restart {}: {error}",
+            config.caddy.container
+        );
+        return ExitCode::from(2);
+    }
+    outln!("wrote the config and restarted {}", config.caddy.container);
+    ExitCode::SUCCESS
+}
+
+fn domains(config: &Config, command: DomainCommand) -> ExitCode {
+    let mut set = match load_domains(&config.caddy.domains) {
+        Ok(set) => set,
+        Err(code) => return code,
+    };
+
+    match command {
+        DomainCommand::List => {
+            for domain in set.entries() {
+                outln!("{:<30} -> {}", clip(&domain.host, 30), domain.upstream);
+            }
+            // Saying where the answer came from matters when the answer is
+            // empty: an unconfigured file and no routes look the same.
+            outln!(
+                "\n{} routed, from {}",
+                set.entries().len(),
+                config.caddy.domains.display()
+            );
+            ExitCode::SUCCESS
+        }
+        DomainCommand::Add {
+            host,
+            upstream,
+            no_reload,
+        } => {
+            if let Err(error) = set.add(&host, &upstream) {
+                eprintln!("adev: {error}");
+                return ExitCode::from(2);
+            }
+            save_domains(config, &set, no_reload)
+        }
+        DomainCommand::Remove { host, no_reload } => {
+            if let Err(error) = set.remove(&host) {
+                eprintln!("adev: {error}");
+                return ExitCode::from(2);
+            }
+            save_domains(config, &set, no_reload)
         }
     }
 }
