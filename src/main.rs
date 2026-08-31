@@ -5,6 +5,7 @@ use aether_dev::config::{self, Config};
 use aether_dev::db::{backup_filename, dump_all_plan, dump_plan, restore_plan, Engine, ExecPlan};
 use aether_dev::docker::{probe_all, DockerClient, DockerError, HttpDockerClient};
 use aether_dev::domain::{Project, ServiceState, ServiceStatus};
+use aether_dev::dotenv;
 use aether_dev::git::GitCli;
 use aether_dev::listen;
 use aether_dev::ports::ScanEvent;
@@ -73,6 +74,7 @@ fn main() -> ExitCode {
         Command::Ports { json } => ports(&config, json),
         Command::Kill { port, dry_run } => kill(port, dry_run),
         Command::Open { target } => open(&config, &target),
+        Command::Dotenv { project, use_file } => dotenv(&config, &project, use_file.as_deref()),
         Command::Db(command) => db(&config, command),
         Command::Domains(command) => domains(&config, command),
         Command::Start { services, all } => lifecycle(&config, &services, all, Action::Start),
@@ -1604,6 +1606,88 @@ fn open_url(url: &str) -> ExitCode {
         }
         Err(error) => {
             eprintln!("adev: cannot open {url}: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn dotenv(config: &Config, project: &str, use_file: Option<&str>) -> ExitCode {
+    let (name, path) = match locate_project(config, project) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+
+    let entries = entries_in(&path);
+    let names = dotenv::candidates(&entries);
+    let variants: Vec<(String, String)> = names
+        .iter()
+        .filter_map(|candidate| {
+            std::fs::read_to_string(path.join(candidate))
+                .ok()
+                .map(|contents| (candidate.clone(), contents))
+        })
+        .collect();
+    let live = path.join(".env");
+    let current = std::fs::read_to_string(&live).ok();
+
+    let Some(wanted) = use_file else {
+        if names.is_empty() {
+            outln!("{name} has no .env variants to switch between");
+            return ExitCode::SUCCESS;
+        }
+        let in_use = current
+            .as_deref()
+            .and_then(|contents| dotenv::active(contents, &variants));
+        for candidate in &names {
+            let marker = if Some(candidate.as_str()) == in_use.as_deref() {
+                "*"
+            } else {
+                " "
+            };
+            outln!("{marker} {candidate}");
+        }
+        match (current.is_some(), in_use) {
+            (false, _) => outln!("\n{name} has no .env at all"),
+            // Named only when the contents actually match. A .env edited by
+            // hand is nobody's copy, and saying otherwise would be a guess.
+            (true, None) => {
+                outln!("\n.env matches none of these; it was edited or written by hand")
+            }
+            (true, Some(_)) => outln!("\n* is the one .env currently matches"),
+        }
+        return ExitCode::SUCCESS;
+    };
+
+    if !names.iter().any(|candidate| candidate == wanted) {
+        eprintln!(
+            "adev: {name} has no {wanted}; it has {}",
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        );
+        return ExitCode::from(2);
+    }
+
+    // The file being replaced is kept first. Overwriting somebody's working
+    // .env with no way back is not a switch, it is a loss.
+    if current.is_some() {
+        if let Err(error) = std::fs::copy(&live, path.join(dotenv::BACKUP)) {
+            eprintln!("adev: cannot keep the current .env: {error}");
+            return ExitCode::from(2);
+        }
+    }
+    match std::fs::copy(path.join(wanted), &live) {
+        Ok(_) => {
+            outln!("{name} now uses {wanted}");
+            if current.is_some() {
+                outln!("the previous .env is {}", dotenv::BACKUP);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("adev: cannot write .env: {error}");
             ExitCode::from(2)
         }
     }

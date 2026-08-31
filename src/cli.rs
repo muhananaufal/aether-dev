@@ -78,6 +78,14 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Show which .env a project is running with, or switch it.
+    Dotenv {
+        project: String,
+        /// The file to copy over .env. The one being replaced is kept as
+        /// .env.bak, so a switch can be undone.
+        #[arg(long = "use", value_name = "FILE")]
+        use_file: Option<String>,
+    },
     /// Open a service or a project in a browser.
     Open {
         /// A service name, or a project name — services are looked at first.
@@ -595,5 +603,23 @@ mod tests {
             }
         );
         assert!(Cli::try_parse_from(["adev", "open"]).is_err());
+    }
+
+    #[test]
+    fn the_env_file_in_use_can_be_listed_or_swapped() {
+        assert_eq!(
+            Cli::parse_from(["adev", "dotenv", "old-billing"]).command,
+            Command::Dotenv {
+                project: "old-billing".to_string(),
+                use_file: None,
+            }
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "dotenv", "old-billing", "--use", ".env.staging"]).command,
+            Command::Dotenv {
+                project: "old-billing".to_string(),
+                use_file: Some(".env.staging".to_string()),
+            }
+        );
     }
 }
