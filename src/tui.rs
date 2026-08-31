@@ -11,6 +11,7 @@
 //! drawing never waits on one — the rule the predecessor broke.
 
 use crate::domain::{GitStatus, Project, ServiceState, ServiceStatus};
+use crate::listen::Listener;
 use crate::memory;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
@@ -98,6 +99,11 @@ pub enum Update {
         scanned: usize,
     },
     Services(Vec<ServiceStatus>),
+    /// Everything listening on this machine, docker or not. A separate fact
+    /// from what docker publishes: the port you are looking for is usually
+    /// held by a stray dev server, not a container.
+    Ports(Vec<Listener>),
+    PortsFailed(String),
     /// What the container host is costing, re-read on a timer.
     Memory(memory::Reading),
     ServicesFailed(String),
@@ -110,6 +116,19 @@ pub enum Update {
         container: String,
         line: String,
     },
+}
+
+/// A box laid over the screen: a list of labelled values with a title.
+///
+/// The settings screen was the first of these and is now one of three, along
+/// with a project's toolchains and the routed hostnames. Anything that is read
+/// rather than acted on belongs here instead of in a fourth pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detail {
+    pub title: String,
+    pub lines: Vec<(String, String)>,
+    /// What to press to leave, and where to go to change what is shown.
+    pub hint: String,
 }
 
 /// A line about something the user just asked for.
@@ -224,10 +243,18 @@ pub struct Dashboard {
     /// dashboard never reads configuration itself: it shows what it is told,
     /// which keeps it free of anything that touches a file.
     settings: Vec<(String, String)>,
-    showing_settings: bool,
+    /// What is laid over the screen, when anything is.
+    detail: Option<Detail>,
+    /// A destructive action waiting for a yes. It takes the status line so it
+    /// cannot be answered by a keystroke meant for something else.
+    confirm: Option<String>,
+    /// A line being typed: what it is for, and what has been typed so far.
+    prompt: Option<(String, String)>,
     /// What the container host is costing this machine. Polled on its own
     /// timer, so a slow probe cannot hold up the rest of the screen.
     memory: memory::Reading,
+    ports: Vec<Listener>,
+    ports_error: Option<String>,
 }
 
 impl Default for Dashboard {
@@ -251,8 +278,12 @@ impl Dashboard {
             help: false,
             logs: None,
             settings: Vec::new(),
-            showing_settings: false,
+            detail: None,
+            confirm: None,
+            prompt: None,
             memory: memory::Reading::default(),
+            ports: Vec::new(),
+            ports_error: None,
         }
     }
 
@@ -269,6 +300,12 @@ impl Dashboard {
                 self.clamp(Pane::Ports);
             }
             Update::ServicesFailed(reason) => self.services_error = Some(reason),
+            Update::Ports(ports) => {
+                self.ports = ports;
+                self.ports_error = None;
+                self.clamp(Pane::Ports);
+            }
+            Update::PortsFailed(reason) => self.ports_error = Some(reason),
             Update::Notice(notice) => self.notice = Some(notice),
             Update::LogLine { container, line } => {
                 // Only for the log actually open. A stream still winding down
@@ -307,12 +344,82 @@ impl Dashboard {
         self.settings = settings;
     }
 
+    /// Shows the settings, which are the one overlay the dashboard can build
+    /// for itself because it was handed the lines at startup.
     pub fn toggle_settings(&mut self) {
-        self.showing_settings = !self.showing_settings;
+        if self.detail.is_some() {
+            self.detail = None;
+            return;
+        }
+        self.detail = Some(Detail {
+            title: "Settings".to_string(),
+            lines: self.settings.clone(),
+            hint: "adev config --edit to change · esc to close".to_string(),
+        });
     }
 
-    pub fn showing_settings(&self) -> bool {
-        self.showing_settings
+    pub fn show_detail(&mut self, detail: Detail) {
+        self.detail = Some(detail);
+    }
+
+    pub fn close_detail(&mut self) {
+        self.detail = None;
+    }
+
+    pub fn showing_detail(&self) -> bool {
+        self.detail.is_some()
+    }
+
+    /// Asks for a line of text: a database name, a file, a hostname.
+    ///
+    /// The dashboard holds the characters and nothing else. What the answer is
+    /// for, and what happens when it arrives, stays with the caller - which is
+    /// how a screen that knows nothing about databases can still ask for one.
+    pub fn ask_for(&mut self, label: impl Into<String>) {
+        self.prompt = Some((label.into(), String::new()));
+    }
+
+    pub fn prompting(&self) -> Option<&str> {
+        self.prompt.as_ref().map(|(label, _)| label.as_str())
+    }
+
+    pub fn type_char(&mut self, c: char) {
+        if let Some((_, typed)) = self.prompt.as_mut() {
+            typed.push(c);
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if let Some((_, typed)) = self.prompt.as_mut() {
+            typed.pop();
+        }
+    }
+
+    /// Takes the answer and closes the prompt. An empty string is a real
+    /// answer - the caller decides whether it will do - while `None` means
+    /// there was nothing being asked.
+    pub fn take_typed(&mut self) -> Option<String> {
+        self.prompt.take().map(|(_, typed)| typed)
+    }
+
+    /// Throws the answer away. Escape must not hand back a half typed name
+    /// that then gets used for something.
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
+    }
+
+    /// Asks a yes-or-no question that must be answered before anything else
+    /// happens. Only for actions that cannot be undone.
+    pub fn ask(&mut self, question: impl Into<String>) {
+        self.confirm = Some(question.into());
+    }
+
+    pub fn confirming(&self) -> Option<&str> {
+        self.confirm.as_deref()
+    }
+
+    pub fn dismiss(&mut self) {
+        self.confirm = None;
     }
 
     pub fn toggle_help(&mut self) {
@@ -336,14 +443,28 @@ impl Dashboard {
             .flatten()
     }
 
-    /// The service the cursor is on, in whichever of the two service panes has
-    /// the focus. The ports pane lists a subset, so the row number there means
-    /// something different.
+    /// The service the cursor is on.
+    ///
+    /// In the ports pane most rows have no container behind them - that is the
+    /// point of listing every listener - so the answer there is whichever
+    /// service published that port, and nothing when none did.
     pub fn selected_service(&self) -> Option<&ServiceStatus> {
         match self.focus {
             Pane::Services => self.services.get(self.selected[Pane::Services.index()]),
-            Pane::Ports => self.published().nth(self.selected[Pane::Ports.index()]),
+            Pane::Ports => {
+                let port = self.selected_port()?.port;
+                self.services.iter().find(|s| s.port == Some(port))
+            }
             Pane::Projects => None,
+        }
+    }
+
+    /// The listener the cursor is on, which exists whether or not docker knows
+    /// anything about it.
+    pub fn selected_port(&self) -> Option<&Listener> {
+        match self.focus {
+            Pane::Ports => self.ports.get(self.selected[Pane::Ports.index()]),
+            _ => None,
         }
     }
 
@@ -404,12 +525,8 @@ impl Dashboard {
         match pane {
             Pane::Projects => self.projects.len(),
             Pane::Services => self.services.len(),
-            Pane::Ports => self.published().count(),
+            Pane::Ports => self.ports.len(),
         }
-    }
-
-    fn published(&self) -> impl Iterator<Item = &ServiceStatus> {
-        self.services.iter().filter(|s| s.port.is_some())
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -454,8 +571,8 @@ impl Dashboard {
     /// Whatever is layered over the screen. Settings first, so the key list
     /// opened on top of it is the one that closes first.
     fn draw_overlays(&self, frame: &mut Frame) {
-        if self.showing_settings {
-            draw_settings(frame, &self.settings);
+        if let Some(detail) = &self.detail {
+            draw_detail(frame, detail);
         }
         if self.help {
             draw_help(frame);
@@ -488,7 +605,7 @@ impl Dashboard {
                 self.service_rows(),
             ),
             Pane::Ports => (
-                vec!["PORT", "SERVICE", ""],
+                vec!["PORT", "PROCESS", "SERVICE"],
                 vec![
                     Constraint::Length(7),
                     Constraint::Fill(1),
@@ -578,15 +695,20 @@ impl Dashboard {
             // running, which is a different thing from a daemon nobody could
             // reach. Neither pane pretends to a number it does not have.
             Pane::Services if self.services_error.is_some() => "unreachable".to_string(),
-            Pane::Ports if self.services_error.is_some() => "unreachable".to_string(),
+            Pane::Ports if self.ports_error.is_some() => "unreadable".to_string(),
             Pane::Services => {
                 let ready = self.services.iter().filter(|s| s.is_reachable()).count();
                 format!("{ready} of {} ready", self.services.len())
             }
             Pane::Ports => {
-                let published: Vec<&ServiceStatus> = self.published().collect();
-                let answering = published.iter().filter(|s| s.port_open).count();
-                format!("{answering} of {} answering", published.len())
+                // How many are containers is the useful split here: the rest
+                // are the ones nothing is managing for you.
+                let docker = self
+                    .ports
+                    .iter()
+                    .filter(|listener| self.services.iter().any(|s| s.port == Some(listener.port)))
+                    .count();
+                format!("{} listening · {docker} docker", self.ports.len())
             }
         }
     }
@@ -629,23 +751,51 @@ impl Dashboard {
     }
 
     fn port_rows(&self) -> Vec<Row<'static>> {
-        self.published()
-            .map(|service| {
-                let (answer, style) = if service.port_open {
-                    ("answering", Style::default().fg(paint::GOOD))
-                } else {
-                    ("no answer", Style::default().fg(paint::BAD))
-                };
+        self.ports
+            .iter()
+            .map(|listener| {
+                // Naming the container when there is one is most of the value:
+                // it turns "something holds 3306" into "that is mysql".
+                let service = self
+                    .services
+                    .iter()
+                    .find(|s| s.port == Some(listener.port))
+                    .map(|s| s.service.clone())
+                    .unwrap_or_default();
                 Row::new(vec![
-                    Cell::from(service.port.unwrap_or_default().to_string()),
-                    Cell::from(service.service.clone()),
-                    Cell::from(answer).style(style),
+                    Cell::from(listener.port.to_string()),
+                    Cell::from(listener.process.clone().unwrap_or_else(|| "-".to_string()))
+                        .style(Style::default().fg(paint::MUTED)),
+                    Cell::from(service).style(Style::default().fg(paint::GOOD)),
                 ])
             })
             .collect()
     }
 
     fn status_line(&self) -> Paragraph<'static> {
+        // A question outranks everything. A collector finishing at the wrong
+        // moment must not push it off the line the answer is typed at.
+        if let Some(question) = &self.confirm {
+            return Paragraph::new(Line::from(Span::styled(
+                format!(" {question}  [y/N] "),
+                Style::default().fg(paint::BAD).add_modifier(Modifier::BOLD),
+            )));
+        }
+        // Next, whatever is being typed. A collector finishing mid-word must
+        // not take the line the answer is going into.
+        if let Some((label, typed)) = &self.prompt {
+            return Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {label}: "), Style::default().fg(paint::HEADING)),
+                Span::styled(typed.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                // Somewhere for the next character to land: a prompt with no
+                // cursor reads as a message rather than as a question.
+                Span::styled("█", Style::default().fg(paint::FOCUS)),
+                Span::styled(
+                    "   enter to accept · esc to cancel",
+                    Style::default().fg(paint::MUTED),
+                ),
+            ]));
+        }
         // What just happened takes the line while it is fresh. The counts are
         // still on every pane's frame, so nothing is actually lost.
         if let Some(notice) = &self.notice {
@@ -733,12 +883,21 @@ const KEYS: &[(&str, &str)] = &[
     ("s", "start the selected service"),
     ("x", "stop it"),
     ("S", "restart it"),
-    ("o", "open its page, or its port, in a browser"),
+    ("o", "open whatever the focused row serves"),
     ("enter", "run the selected project"),
     ("l", "read the selected service's log"),
     ("t", "open a shell in a project, on its own toolchain"),
     ("e", "open the selected project's folder"),
     ("b", "back up the selected service's databases"),
+    ("K", "end what holds the selected port"),
+    ("v", "the toolchain versions a project resolves to"),
+    ("d", "the hostnames the proxy serves"),
+    ("A", "route a new hostname"),
+    ("X", "stop routing one"),
+    ("E", "dump one database to a file"),
+    ("I", "load a dump into a database"),
+    (".", "which .env a project uses, and switch it"),
+    (":", "run one command in a project"),
     ("r", "refresh this pane"),
     ("R", "refresh everything"),
     ("g", "the settings in force, and where they live"),
@@ -862,12 +1021,13 @@ fn draw_logs(frame: &mut Frame, view: &LogView) {
 /// each choice, and rewriting it from a form would throw those away every time
 /// somebody changed a number - so this says what is in force and where to go
 /// and change it.
-fn draw_settings(frame: &mut Frame, lines: &[(String, String)]) {
+fn draw_detail(frame: &mut Frame, detail: &Detail) {
     let width = 74;
-    let height = (lines.len() as u16 + 2).min(frame.area().height);
+    let height = (detail.lines.len() as u16 + 2).min(frame.area().height);
     let area = centred(frame.area(), width, height);
 
-    let rows: Vec<Row<'static>> = lines
+    let rows: Vec<Row<'static>> = detail
+        .lines
         .iter()
         .map(|(key, value)| {
             Row::new(vec![
@@ -885,13 +1045,13 @@ fn draw_settings(frame: &mut Frame, lines: &[(String, String)]) {
                     .border_style(Style::default().fg(paint::FOCUS))
                     .padding(Padding::horizontal(1))
                     .title(Span::styled(
-                        " Settings ",
+                        format!(" {} ", detail.title),
                         Style::default()
                             .fg(paint::FOCUS)
                             .add_modifier(Modifier::BOLD),
                     ))
                     .title_bottom(Span::styled(
-                        " adev config --edit to change · g or esc to close ",
+                        format!(" {} ", detail.hint),
                         Style::default().fg(paint::MUTED),
                     )),
             )
@@ -902,41 +1062,61 @@ fn draw_settings(frame: &mut Frame, lines: &[(String, String)]) {
 
 /// Draws the key list over whatever is behind it.
 fn draw_help(frame: &mut Frame) {
-    let width = 60;
-    let height = KEYS.len() as u16 + 2;
-    let area = centred(frame.area(), width, height);
-
-    let rows: Vec<Row<'static>> = KEYS
-        .iter()
-        .map(|(key, meaning)| {
-            Row::new(vec![
-                Cell::from(*key).style(Style::default().fg(paint::FOCUS)),
-                Cell::from(*meaning),
-            ])
+    // Two columns, because one is now taller than a 24-row terminal and a key
+    // list that scrolls off the screen is not a key list.
+    let half = KEYS.len().div_ceil(2);
+    let rows: Vec<Row<'static>> = (0..half)
+        .map(|row| {
+            let mut cells = vec![
+                Cell::from(KEYS[row].0).style(Style::default().fg(paint::FOCUS)),
+                Cell::from(KEYS[row].1),
+            ];
+            match KEYS.get(row + half) {
+                Some((key, meaning)) => {
+                    cells.push(Cell::from(*key).style(Style::default().fg(paint::FOCUS)));
+                    cells.push(Cell::from(*meaning));
+                }
+                // An odd number of keys leaves the last cell empty rather than
+                // wrapping one entry onto a row of its own.
+                None => cells.extend([Cell::from(""), Cell::from("")]),
+            }
+            Row::new(cells)
         })
         .collect();
+
+    let width = 104;
+    let height = half as u16 + 2;
+    let area = centred(frame.area(), width, height);
 
     // Cleared first: without it the list underneath shows through the gaps
     // between words and neither is readable.
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Table::new(rows, [Constraint::Length(13), Constraint::Fill(1)])
-            .block(
-                Block::bordered()
-                    .border_style(Style::default().fg(paint::FOCUS))
-                    .padding(Padding::horizontal(1))
-                    .title(Span::styled(
-                        " Keys ",
-                        Style::default()
-                            .fg(paint::FOCUS)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .title_bottom(Span::styled(
-                        " ? or esc to close ",
-                        Style::default().fg(paint::MUTED),
-                    )),
-            )
-            .column_spacing(2),
+        Table::new(
+            rows,
+            [
+                Constraint::Length(13),
+                Constraint::Fill(1),
+                Constraint::Length(7),
+                Constraint::Fill(1),
+            ],
+        )
+        .block(
+            Block::bordered()
+                .border_style(Style::default().fg(paint::FOCUS))
+                .padding(Padding::horizontal(1))
+                .title(Span::styled(
+                    " Keys ",
+                    Style::default()
+                        .fg(paint::FOCUS)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .title_bottom(Span::styled(
+                    " ? or esc to close ",
+                    Style::default().fg(paint::MUTED),
+                )),
+        )
+        .column_spacing(2),
         area,
     );
 }
@@ -1155,14 +1335,215 @@ mod tests {
         );
     }
 
+    fn listener(port: u16, process: &str, pid: u32) -> Listener {
+        Listener {
+            port,
+            pid: Some(pid),
+            process: Some(process.to_string()),
+        }
+    }
+
     #[test]
-    fn ports_lists_only_the_services_that_publish_one() {
+    fn the_ports_pane_lists_every_listener_not_only_the_docker_ones() {
         let mut dashboard = Dashboard::new();
-        let mut quiet = service("internal", 0, false);
-        quiet.port = None;
-        dashboard.apply(Update::Services(vec![service("mysql", 3306, true), quiet]));
-        assert_eq!(dashboard.rows_in(Pane::Services), 2);
-        assert_eq!(dashboard.rows_in(Pane::Ports), 1);
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        dashboard.apply(Update::Ports(vec![
+            listener(3306, "wslrelay.exe", 17336),
+            listener(5173, "node.exe", 900),
+            listener(22, "sshd.exe", 4764),
+        ]));
+
+        assert_eq!(
+            dashboard.rows_in(Pane::Ports),
+            3,
+            "the pane is called Ports; a stray dev server is the usual reason to look at it"
+        );
+    }
+
+    #[test]
+    fn a_port_that_belongs_to_a_container_still_reaches_that_service() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        dashboard.apply(Update::Ports(vec![
+            listener(22, "sshd.exe", 4764),
+            listener(3306, "wslrelay.exe", 17336),
+        ]));
+        dashboard.focus_on(Pane::Ports);
+        dashboard.move_selection(1);
+
+        assert_eq!(
+            dashboard.selected_service().map(|s| s.service.as_str()),
+            Some("mysql"),
+            "start, stop and logs must keep working from this pane"
+        );
+    }
+
+    #[test]
+    fn a_port_no_container_owns_resolves_to_no_service() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        dashboard.apply(Update::Ports(vec![listener(5173, "node.exe", 900)]));
+        dashboard.focus_on(Pane::Ports);
+
+        assert!(
+            dashboard.selected_service().is_none(),
+            "a stray dev server has no container to stop"
+        );
+        assert_eq!(dashboard.selected_port().map(|l| l.port), Some(5173));
+    }
+
+    #[test]
+    fn a_stray_dev_server_is_on_screen_with_the_process_holding_it() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        dashboard.apply(Update::Ports(vec![
+            listener(3306, "wslrelay.exe", 17336),
+            listener(5173, "node.exe", 900),
+        ]));
+
+        let view = screen(&drawn(&mut dashboard, 140, 24));
+        assert!(view.contains("5173"), "the stray port itself");
+        assert!(view.contains("node.exe"), "what is holding it");
+        assert!(
+            view.contains("mysql"),
+            "and the container name where there is one"
+        );
+        assert!(
+            view.contains("2 listening"),
+            "the count belongs on the frame; got {view}"
+        );
+    }
+
+    #[test]
+    fn a_question_takes_the_status_line_until_it_is_answered() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.apply(Update::Notice(Notice::done("started mysql")));
+        dashboard.ask("kill node.exe (pid 900) on 5173?");
+
+        let footer = lines(&drawn(&mut dashboard, 140, 20)).pop().unwrap();
+        assert!(footer.contains("kill node.exe"), "got {footer:?}");
+        assert!(
+            !footer.contains("started mysql"),
+            "a question that shares its line with an old notice can be answered by accident"
+        );
+        assert_eq!(
+            dashboard.confirming(),
+            Some("kill node.exe (pid 900) on 5173?")
+        );
+
+        dashboard.dismiss();
+        assert_eq!(dashboard.confirming(), None);
+    }
+
+    #[test]
+    fn an_arriving_notice_cannot_replace_a_question_that_is_still_open() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.ask("kill node.exe (pid 900) on 5173?");
+        // A collector finishing at the wrong moment must not turn a pending
+        // "kill this?" into something the next keystroke answers blind.
+        dashboard.apply(Update::Notice(Notice::done("rereading ports")));
+
+        let footer = lines(&drawn(&mut dashboard, 140, 20)).pop().unwrap();
+        assert!(footer.contains("kill node.exe"), "got {footer:?}");
+    }
+
+    #[test]
+    fn what_is_typed_appears_on_the_status_line_and_comes_back_on_enter() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.ask_for("database to export");
+
+        for c in "shop_db".chars() {
+            dashboard.type_char(c);
+        }
+        dashboard.backspace();
+
+        let footer = lines(&drawn(&mut dashboard, 140, 20)).pop().unwrap();
+        assert!(footer.contains("database to export"), "got {footer:?}");
+        assert!(footer.contains("shop_d"), "what has been typed so far");
+
+        assert_eq!(dashboard.take_typed(), Some("shop_d".to_string()));
+        assert!(
+            dashboard.prompting().is_none(),
+            "taking the answer closes the prompt"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_prompt_yields_nothing_at_all() {
+        let mut dashboard = Dashboard::new();
+        dashboard.ask_for("database to export");
+        dashboard.type_char('x');
+        dashboard.cancel_prompt();
+
+        assert!(dashboard.prompting().is_none());
+        assert_eq!(
+            dashboard.take_typed(),
+            None,
+            "a cancelled prompt must not hand back what was half typed"
+        );
+    }
+
+    #[test]
+    fn an_arriving_notice_cannot_overwrite_what_is_being_typed() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.ask_for("database to export");
+        dashboard.type_char('s');
+        dashboard.apply(Update::Notice(Notice::done("rereading services")));
+
+        let footer = lines(&drawn(&mut dashboard, 140, 20)).pop().unwrap();
+        assert!(
+            footer.contains("database to export"),
+            "a collector must not take the line from under a half typed answer; got {footer:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_is_still_an_answer_the_caller_can_refuse() {
+        let mut dashboard = Dashboard::new();
+        dashboard.ask_for("database to export");
+        assert_eq!(
+            dashboard.take_typed(),
+            Some(String::new()),
+            "enter on an empty prompt is a decision, not a cancellation"
+        );
+    }
+
+    #[test]
+    fn a_detail_overlay_carries_its_own_title_and_lines() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.show_detail(Detail {
+            title: "shop-web".to_string(),
+            lines: vec![(
+                "php".to_string(),
+                "7.4.33  asked for by the project".to_string(),
+            )],
+            hint: "esc to close".to_string(),
+        });
+
+        let view = screen(&drawn(&mut dashboard, 140, 24));
+        assert!(view.contains("shop-web"), "the title names what is shown");
+        assert!(view.contains("7.4.33"), "got {view}");
+        assert!(dashboard.showing_detail());
+
+        dashboard.close_detail();
+        assert!(!dashboard.showing_detail());
+    }
+
+    #[test]
+    fn the_ports_pane_is_empty_until_its_own_collector_reports() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        assert_eq!(
+            dashboard.rows_in(Pane::Ports),
+            0,
+            "docker publishing a port is not the same fact as something listening on it"
+        );
     }
 
     #[test]
@@ -1286,8 +1667,8 @@ mod tests {
         );
         assert!(view.contains("2 of 3 ready"), "services ready out of total");
         assert!(
-            view.contains("2 of 3 answering"),
-            "ports answering out of published"
+            view.contains("0 listening"),
+            "the ports pane counts listeners, and none have been reported here"
         );
     }
 
@@ -1383,18 +1764,19 @@ mod tests {
     }
 
     #[test]
-    fn the_ports_pane_selects_by_its_own_shorter_list() {
+    fn the_ports_pane_selects_by_its_own_list_not_the_services_one() {
         let mut dashboard = Dashboard::new();
         let mut quiet = service("internal", 0, false);
         quiet.port = None;
         // The unpublished one sits first, so a shared row number would pick it.
         dashboard.apply(Update::Services(vec![quiet, service("mysql", 3306, true)]));
+        dashboard.apply(Update::Ports(vec![listener(3306, "wslrelay.exe", 17336)]));
 
         dashboard.focus_on(Pane::Ports);
         assert_eq!(
             dashboard.selected_service().map(|s| s.service.as_str()),
             Some("mysql"),
-            "row 0 of ports is the first published service, not the first service"
+            "row 0 of ports is a listener, resolved to whichever service published it"
         );
     }
 

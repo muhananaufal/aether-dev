@@ -17,6 +17,8 @@ pub enum DbError {
     },
     #[error("{0:?} is not a usable database name")]
     InvalidDatabase(String),
+    #[error("the dump is gzipped but unreadable: {0}")]
+    UnreadableDump(String),
     #[error("no dump tool is known for the image {0:?}")]
     UnknownEngine(String),
 }
@@ -190,6 +192,22 @@ pub fn dump_plan(
             env: Vec::new(),
         }),
     }
+}
+
+/// Returns the dump as it should reach the database, decompressing it when it
+/// is gzipped.
+///
+/// Decided from the content rather than from a file name, because a dump does
+/// not stop being gzipped when somebody renames it - and compressed bytes fed
+/// to a database fail in a way that does not point back here.
+pub fn decode_dump(bytes: Vec<u8>) -> Result<Vec<u8>, DbError> {
+    if !bytes.starts_with(&[0x1f, 0x8b]) {
+        return Ok(bytes);
+    }
+    let mut plain = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut plain)
+        .map(|_| plain)
+        .map_err(|error| DbError::UnreadableDump(error.to_string()))
 }
 
 /// Splits on the first equals sign only: a password may well contain more.
@@ -410,6 +428,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_gzipped_dump_is_decompressed_and_a_plain_one_is_left_alone() {
+        use std::io::Write;
+        let sql = b"CREATE TABLE orders (id INT);\n".to_vec();
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&sql).unwrap();
+        let gzipped = encoder.finish().unwrap();
+        assert_ne!(gzipped, sql, "the fixture must actually be compressed");
+
+        assert_eq!(decode_dump(gzipped).unwrap(), sql);
+        assert_eq!(
+            decode_dump(sql.clone()).unwrap(),
+            sql,
+            "a plain dump must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn a_file_that_only_looks_gzipped_is_refused_rather_than_sent_on() {
+        // The magic bytes with nothing valid behind them: feeding this to a
+        // database would fail somewhere far from the cause.
+        let err = decode_dump(vec![0x1f, 0x8b, 0x00, 0x00]).unwrap_err();
+        assert!(matches!(err, DbError::UnreadableDump(_)), "got {err:?}");
     }
 
     #[test]
