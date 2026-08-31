@@ -15,12 +15,14 @@ inside WSL. Expect the rough edges of a tool that has met one environment.**
 ## Commands
 
 ```
-adev scan       [--json]              projects, stack, branch, working-tree state
-adev services   [--json]              containers and whether they are actually usable
+adev scan       [--json]              projects, framework and version, branch, changes
+adev services   [--json] [--memory]   containers and whether they are actually usable
 adev ports      [--json]              published ports and whether they answer
+adev start|stop|restart <service...>  for containers that already exist
 adev logs <service> [-f] [-n N]       what a service is writing
 adev db export <service> --database <db> --out <file> [--gzip] [--force]
 adev db import <service> --database <db> --file <file>
+adev db backup --out <dir> [--gzip]   every database on every running service
 adev domains    list
 adev domains    add <host> <container:port> [--no-reload]
 adev domains    remove <host> [--no-reload]
@@ -99,8 +101,16 @@ reports.
 - MySQL and Postgres keep the password out of the command line;
   `mongodump` offers no equivalent, so for Mongo it is visible in that
   container's process list while the dump runs.
+- `start` acts on containers that exist. A service the compose file describes
+  but that has never been created has nothing to start, and says so.
+- `--memory` costs about a second and a half per container, which is why the
+  listing does not include it by default.
 - The dashboard is monochrome and shows projects, services and ports. Logs
-  are a command only.
+  and memory are commands only.
+- Not carried over from the predecessor, deliberately: switching a project's
+  PHP or Node version, launching a terminal with that toolchain on PATH, and
+  opening a folder or editor. Those were buttons because it was a window; in
+  a terminal you are already where `cd` and your editor live.
 - The Caddyfile is rewritten from the domains file. Anything added to it by
   hand is lost on the next change.
 

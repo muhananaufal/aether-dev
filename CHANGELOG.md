@@ -7,16 +7,17 @@ window on one machine.
 
 ### Commands
 
-- `scan` — projects with stack, branch and working-tree state, gathered
-  concurrently. Measured against the predecessor on the same 24 repositories:
-  5,983 ms sequentially, under a second here.
+- `scan` — projects with framework and version, branch and working-tree state,
+  gathered concurrently. Measured against the predecessor on the same 24
+  repositories: 5,983 ms sequentially, 0.39s here. The framework version is
+  the one installed rather than the constraint a manifest asks for.
 - `services` — containers, with `ready` distinguished from `starting` so a
   database that is up but not yet accepting connections is not reported as
   usable. `--memory` adds usage matching what `docker stats` reports.
 - `ports` — published ports and whether they answer.
-- `start` / `stop` / `restart` — for containers that exist. A service the
-  compose file describes but that has never been created is reported as
-  having nothing to act on rather than silently skipped.
+- `start` / `stop` / `restart` — for containers that exist.
+- `db backup` — every database on every running database service, into a
+  timestamped directory. Verified at 55 databases in one file.
 - `logs` — with `--follow` and `--tail`.
 - `db export` / `db import` — MySQL, Postgres and Mongo. Credentials are read
   from the container's own environment; nothing is stored or asked for.
