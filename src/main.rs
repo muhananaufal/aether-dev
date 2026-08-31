@@ -12,7 +12,7 @@ use aether_dev::proxy::DomainSet;
 use aether_dev::recipe;
 use aether_dev::scan::FsProjectScanner;
 use aether_dev::toolchain::{self, Reason, Resolution};
-use aether_dev::tui::{Dashboard, Pane, Update};
+use aether_dev::tui::{Dashboard, Notice, Pane, Update};
 use clap::Parser;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -337,7 +337,7 @@ fn tui(config: &Config) -> ExitCode {
     let (updates, incoming) = mpsc::channel();
     spawn_collectors(config, updates.clone());
 
-    let outcome: std::io::Result<()> = ratatui::run(|terminal| {
+    let outcome: std::io::Result<Leave> = ratatui::run(|terminal| {
         loop {
             // Take whatever has arrived and move on. Blocking here to wait for
             // a collector is exactly the mistake that froze the tool this
@@ -360,7 +360,11 @@ fn tui(config: &Config) -> ExitCode {
                 continue;
             }
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                KeyCode::Char('?') => dashboard.toggle_help(),
+                // Esc closes the key list when it is open, and only quits when
+                // there is nothing left to close.
+                KeyCode::Esc if dashboard.showing_help() => dashboard.toggle_help(),
+                KeyCode::Char('q') | KeyCode::Esc => break Ok(Leave::Quit),
                 KeyCode::Tab | KeyCode::Right => dashboard.focus_next(),
                 KeyCode::BackTab | KeyCode::Left => dashboard.focus_previous(),
                 KeyCode::Char('1') => dashboard.focus_on(Pane::Projects),
@@ -376,13 +380,66 @@ fn tui(config: &Config) -> ExitCode {
                     dashboard.begin_refresh();
                     spawn_collectors(config, updates.clone());
                 }
+
+                // Container actions stay here: they finish in a moment and the
+                // answer belongs beside the row that changed.
+                KeyCode::Char('s') | KeyCode::Char('x') | KeyCode::Char('S') => {
+                    let action = match key.code {
+                        KeyCode::Char('s') => Action::Start,
+                        KeyCode::Char('x') => Action::Stop,
+                        _ => Action::Restart,
+                    };
+                    match dashboard.selected_service() {
+                        Some(service) => spawn_service_action(
+                            config,
+                            service.container.clone(),
+                            action,
+                            updates.clone(),
+                        ),
+                        None => dashboard.apply(Update::Notice(Notice::failed(
+                            "no service here — move to the services or ports pane first",
+                        ))),
+                    }
+                }
+
+                KeyCode::Char('o') => {
+                    let url = dashboard
+                        .selected_service()
+                        .and_then(|service| service.port)
+                        .map(|port| format!("http://localhost:{port}"));
+                    let notice = match url {
+                        Some(url) => match open_in_browser(&url) {
+                            Ok(()) => Notice::done(format!("opened {url}")),
+                            Err(error) => Notice::failed(format!("{url}: {error}")),
+                        },
+                        None => Notice::failed("nothing here publishes a port to open"),
+                    };
+                    dashboard.apply(Update::Notice(notice));
+                }
+
+                // Anything that wants the terminal gets it, once the dashboard
+                // has handed it back. Fighting over stdout would garble both.
+                KeyCode::Enter => match dashboard.selected_project() {
+                    Some(project) => break Ok(Leave::Run(project.name.clone())),
+                    None => dashboard.apply(Update::Notice(Notice::failed(
+                        "enter starts a project — move to the projects pane first",
+                    ))),
+                },
+                KeyCode::Char('t') => match dashboard.selected_project() {
+                    Some(project) => break Ok(Leave::Shell(project.name.clone())),
+                    None => dashboard.apply(Update::Notice(Notice::failed(
+                        "t opens a shell in a project — move to the projects pane first",
+                    ))),
+                },
                 _ => {}
             }
         }
     });
 
     match outcome {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Leave::Quit) => ExitCode::SUCCESS,
+        Ok(Leave::Run(project)) => run(config, &project, false),
+        Ok(Leave::Shell(project)) => shell(config, &project, None),
         Err(error) => {
             eprintln!("adev: {error}");
             ExitCode::from(2)
@@ -1325,4 +1382,93 @@ fn run(config: &Config, project: &str, print: bool) -> ExitCode {
         eprintln!("adev: {} · http://localhost:{port}", plan.command);
     }
     run_with_toolchain(config, &name, &path, &argv)
+}
+
+/// Why the dashboard closed. Anything that takes over the terminal happens
+/// after it has been handed back, rather than fighting the drawing for it.
+enum Leave {
+    Quit,
+    Run(String),
+    Shell(String),
+}
+
+impl Action {
+    fn doing(self) -> &'static str {
+        match self {
+            Action::Start => "starting",
+            Action::Stop => "stopping",
+            Action::Restart => "restarting",
+        }
+    }
+}
+
+/// Acts on a container and then re-reads the service list, on its own thread.
+///
+/// Both halves matter: without the refresh the row the user just changed would
+/// keep showing what it said before, which is the same kind of lie as calling a
+/// starting database ready.
+fn spawn_service_action(
+    config: &Config,
+    container: String,
+    action: Action,
+    updates: Sender<Update>,
+) {
+    let _ = updates.send(Update::Notice(Notice::working(format!(
+        "{} {container}…",
+        action.doing()
+    ))));
+
+    let endpoint = config.docker.endpoint.clone();
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    std::thread::spawn(move || {
+        let client = match HttpDockerClient::new(&endpoint, docker_host.as_deref()) {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = updates.send(Update::Notice(Notice::failed(error.to_string())));
+                return;
+            }
+        };
+        let outcome = match action {
+            Action::Start => client.start(&container),
+            Action::Stop => client.stop(&container),
+            Action::Restart => client.restart(&container),
+        };
+        let notice = match outcome {
+            Ok(()) => Notice::done(format!("{} {container}", action.done())),
+            Err(error) => Notice::failed(format!("{container}: {error}")),
+        };
+        let _ = updates.send(Update::Notice(notice));
+
+        if let Ok(mut services) = client.services() {
+            probe_all(&mut services, PORT_PROBE);
+            services.sort_by(|a, b| a.service.cmp(&b.service));
+            let _ = updates.send(Update::Services(services));
+        }
+    });
+}
+
+/// Hands a URL to whatever the system opens links with.
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        // The empty argument is the window title start expects; without it the
+        // URL is taken as the title and nothing opens.
+        command.args(["/C", "start", "", url]);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    command.spawn().map(|_| ())
 }

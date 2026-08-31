@@ -15,8 +15,8 @@ use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
-    TableState,
+    Block, Cell, Clear, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Table, TableState,
 };
 use ratatui::Frame;
 use std::path::PathBuf;
@@ -89,10 +89,50 @@ impl Pane {
 #[derive(Debug)]
 pub enum Update {
     Project(Project),
-    ScanFailed { path: PathBuf, reason: String },
-    ScanFinished { scanned: usize },
+    ScanFailed {
+        path: PathBuf,
+        reason: String,
+    },
+    ScanFinished {
+        scanned: usize,
+    },
     Services(Vec<ServiceStatus>),
     ServicesFailed(String),
+    /// What an action the user asked for is doing. Actions run on their own
+    /// threads, so the only way they can report is the same way collectors do.
+    Notice(Notice),
+}
+
+/// A line about something the user just asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub text: String,
+    /// `None` while it is still happening. A spinner would say less than the
+    /// word "starting" does.
+    pub ok: Option<bool>,
+}
+
+impl Notice {
+    pub fn working(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ok: None,
+        }
+    }
+
+    pub fn done(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ok: Some(true),
+        }
+    }
+
+    pub fn failed(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ok: Some(false),
+        }
+    }
 }
 
 pub struct Dashboard {
@@ -108,6 +148,10 @@ pub struct Dashboard {
     /// Held rather than rebuilt each frame so a list keeps its scroll position
     /// instead of jumping back whenever the selection moves.
     tables: [TableState; 3],
+    /// The last thing an action said. Replaced rather than queued: what is
+    /// happening now is what matters, and a backlog of old lines would bury it.
+    notice: Option<Notice>,
+    help: bool,
 }
 
 impl Default for Dashboard {
@@ -127,6 +171,8 @@ impl Dashboard {
             focus: Pane::Projects,
             selected: [0; 3],
             tables: Default::default(),
+            notice: None,
+            help: false,
         }
     }
 
@@ -142,6 +188,39 @@ impl Dashboard {
                 self.clamp(Pane::Ports);
             }
             Update::ServicesFailed(reason) => self.services_error = Some(reason),
+            Update::Notice(notice) => self.notice = Some(notice),
+        }
+    }
+
+    pub fn toggle_help(&mut self) {
+        self.help = !self.help;
+    }
+
+    pub fn showing_help(&self) -> bool {
+        self.help
+    }
+
+    pub fn notice(&self) -> Option<&Notice> {
+        self.notice.as_ref()
+    }
+
+    /// The project the cursor is on, when the projects pane has the focus.
+    /// Actions read this rather than being told a name, so what happens is
+    /// always what the highlighted row says.
+    pub fn selected_project(&self) -> Option<&Project> {
+        (self.focus == Pane::Projects)
+            .then(|| self.projects.get(self.selected[Pane::Projects.index()]))
+            .flatten()
+    }
+
+    /// The service the cursor is on, in whichever of the two service panes has
+    /// the focus. The ports pane lists a subset, so the row number there means
+    /// something different.
+    pub fn selected_service(&self) -> Option<&ServiceStatus> {
+        match self.focus {
+            Pane::Services => self.services.get(self.selected[Pane::Services.index()]),
+            Pane::Ports => self.published().nth(self.selected[Pane::Ports.index()]),
+            Pane::Projects => None,
         }
     }
 
@@ -238,6 +317,10 @@ impl Dashboard {
             frame.render_widget(key_hints(), keys);
         } else {
             frame.render_widget(self.status_line(), status);
+        }
+
+        if self.help {
+            draw_help(frame);
         }
     }
 
@@ -425,6 +508,17 @@ impl Dashboard {
     }
 
     fn status_line(&self) -> Paragraph<'static> {
+        // What just happened takes the line while it is fresh. The counts are
+        // still on every pane's frame, so nothing is actually lost.
+        if let Some(notice) = &self.notice {
+            let style = match notice.ok {
+                None => Style::default().fg(paint::WAITING),
+                Some(true) => Style::default().fg(paint::GOOD),
+                Some(false) => Style::default().fg(paint::BAD),
+            };
+            return Paragraph::new(Line::from(Span::styled(format!(" {}", notice.text), style)));
+        }
+
         let dim = Style::default().fg(paint::MUTED);
         let mut spans = vec![Span::styled(
             format!(" {} projects", self.projects.len()),
@@ -468,10 +562,39 @@ impl Dashboard {
     }
 }
 
+/// Every key, on request. The status line has room for two of them, and a
+/// dashboard with a dozen actions cannot teach them from a strip of text.
+const KEYS: &[(&str, &str)] = &[
+    ("tab / 1 2 3", "move between panes"),
+    ("j k  ↑ ↓", "move within a pane"),
+    ("s", "start the selected service"),
+    ("x", "stop it"),
+    ("S", "restart it"),
+    ("o", "open its port in a browser"),
+    ("enter", "run the selected project"),
+    ("t", "open a shell in it, on its own toolchain"),
+    ("r", "refresh everything"),
+    ("?", "this list"),
+    ("q", "quit"),
+];
+
+/// A box in the middle, sized to its contents rather than to a percentage of
+/// the screen, so it does not grow silly on a wide terminal.
+fn centred(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
 /// The keys, kept to the right so the numbers on the left are read first.
 fn key_hints() -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(
-        "tab/1-3 pane · j/k move · r refresh · q quit ",
+        "? keys · r refresh · q quit ",
         Style::default().fg(paint::FRAME),
     )))
     .alignment(Alignment::Right)
@@ -508,6 +631,47 @@ fn condition_style(service: &ServiceStatus) -> Style {
         (ServiceState::Running, false) => Style::default().fg(paint::WAITING),
         (ServiceState::Stopped, _) => Style::default().fg(paint::MUTED),
     }
+}
+
+/// Draws the key list over whatever is behind it.
+fn draw_help(frame: &mut Frame) {
+    let width = 60;
+    let height = KEYS.len() as u16 + 2;
+    let area = centred(frame.area(), width, height);
+
+    let rows: Vec<Row<'static>> = KEYS
+        .iter()
+        .map(|(key, meaning)| {
+            Row::new(vec![
+                Cell::from(*key).style(Style::default().fg(paint::FOCUS)),
+                Cell::from(*meaning),
+            ])
+        })
+        .collect();
+
+    // Cleared first: without it the list underneath shows through the gaps
+    // between words and neither is readable.
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Table::new(rows, [Constraint::Length(13), Constraint::Fill(1)])
+            .block(
+                Block::bordered()
+                    .border_style(Style::default().fg(paint::FOCUS))
+                    .padding(Padding::horizontal(1))
+                    .title(Span::styled(
+                        " Keys ",
+                        Style::default()
+                            .fg(paint::FOCUS)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .title_bottom(Span::styled(
+                        " ? or esc to close ",
+                        Style::default().fg(paint::MUTED),
+                    )),
+            )
+            .column_spacing(2),
+        area,
+    );
 }
 
 #[cfg(test)]
@@ -861,6 +1025,103 @@ mod tests {
             buffer[(ready_at, ready_row as u16)].style().fg,
             buffer[(stopped_at, stopped_row as u16)].style().fg,
             "colour should carry the same distinction the word does"
+        );
+    }
+
+    #[test]
+    fn what_an_action_is_doing_takes_the_status_line_while_it_is_fresh() {
+        let mut dashboard = with_projects(3);
+        assert!(screen(&drawn(&mut dashboard, 120, 20)).contains("3 projects"));
+
+        dashboard.apply(Update::Notice(Notice::working("starting mysql")));
+        let view = screen(&drawn(&mut dashboard, 120, 20));
+        assert!(view.contains("starting mysql"));
+        assert!(
+            view.contains("3 of 3 examined"),
+            "the counts move to the frames rather than disappearing"
+        );
+    }
+
+    #[test]
+    fn the_newest_notice_replaces_the_last_rather_than_queueing_behind_it() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::Notice(Notice::working("starting mysql")));
+        dashboard.apply(Update::Notice(Notice::done("started mysql")));
+        assert_eq!(
+            dashboard.notice().map(|n| n.text.as_str()),
+            Some("started mysql")
+        );
+        assert_eq!(dashboard.notice().and_then(|n| n.ok), Some(true));
+    }
+
+    #[test]
+    fn an_action_reads_the_row_the_cursor_is_on_not_a_name_it_was_told() {
+        let mut dashboard = with_projects(3);
+        with_services(&mut dashboard);
+
+        dashboard.move_selection(2);
+        assert_eq!(
+            dashboard.selected_project().map(|p| p.name.as_str()),
+            Some("p2")
+        );
+        assert!(
+            dashboard.selected_service().is_none(),
+            "a service action from the projects pane would act on something unseen"
+        );
+
+        dashboard.focus_on(Pane::Services);
+        dashboard.move_selection(1);
+        assert_eq!(
+            dashboard.selected_service().map(|s| s.service.as_str()),
+            Some("dbgate")
+        );
+        assert!(dashboard.selected_project().is_none());
+    }
+
+    #[test]
+    fn the_ports_pane_selects_by_its_own_shorter_list() {
+        let mut dashboard = Dashboard::new();
+        let mut quiet = service("internal", 0, false);
+        quiet.port = None;
+        // The unpublished one sits first, so a shared row number would pick it.
+        dashboard.apply(Update::Services(vec![quiet, service("mysql", 3306, true)]));
+
+        dashboard.focus_on(Pane::Ports);
+        assert_eq!(
+            dashboard.selected_service().map(|s| s.service.as_str()),
+            Some("mysql"),
+            "row 0 of ports is the first published service, not the first service"
+        );
+    }
+
+    #[test]
+    fn the_key_list_is_available_on_request_rather_than_crammed_into_one_line() {
+        let mut dashboard = with_projects(3);
+        let quiet = screen(&drawn(&mut dashboard, 120, 24));
+        assert!(!quiet.contains("start the selected service"));
+        assert!(quiet.contains("? keys"), "the way in has to be visible");
+
+        dashboard.toggle_help();
+        let helping = screen(&drawn(&mut dashboard, 120, 24));
+        assert!(helping.contains("start the selected service"));
+        assert!(helping.contains("run the selected project"));
+
+        dashboard.toggle_help();
+        assert!(!screen(&drawn(&mut dashboard, 120, 24)).contains("start the selected service"));
+    }
+
+    #[test]
+    fn the_key_list_covers_what_it_draws_rather_than_showing_through_it() {
+        let mut dashboard = with_projects(30);
+        dashboard.toggle_help();
+        let lines = lines(&drawn(&mut dashboard, 120, 24));
+        let overlay = lines
+            .iter()
+            .find(|line| line.contains("start the selected service"))
+            .expect("the key list");
+        assert!(
+            !overlay.contains("p1"),
+            "a row from the list underneath showing through would make both unreadable"
         );
     }
 }
