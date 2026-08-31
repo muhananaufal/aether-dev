@@ -101,6 +101,12 @@ pub enum Update {
     /// What an action the user asked for is doing. Actions run on their own
     /// threads, so the only way they can report is the same way collectors do.
     Notice(Notice),
+    /// One line a container wrote. It carries the container name so a stream
+    /// still winding down after its view was closed cannot pour into the next.
+    LogLine {
+        container: String,
+        line: String,
+    },
 }
 
 /// A line about something the user just asked for.
@@ -135,6 +141,62 @@ impl Notice {
     }
 }
 
+/// The log of one service, held while it is being watched.
+///
+/// A ring rather than a growing list: a chatty container would otherwise use
+/// memory without limit for lines nobody will scroll back to.
+pub struct LogView {
+    container: String,
+    lines: std::collections::VecDeque<String>,
+    /// How far back from the newest line the view is. Zero follows the tail,
+    /// which is what a log is usually opened for.
+    scroll: usize,
+}
+
+impl LogView {
+    /// Enough to scroll back through, small enough that a container writing
+    /// thousands of lines a second cannot exhaust memory.
+    const KEPT: usize = 2000;
+
+    fn new(container: String) -> Self {
+        Self {
+            container,
+            lines: std::collections::VecDeque::new(),
+            scroll: 0,
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        self.lines.push_back(line);
+        if self.lines.len() > Self::KEPT {
+            self.lines.pop_front();
+        }
+        // Scrolled back on purpose: hold that position instead of yanking the
+        // reader to the bottom every time a line arrives.
+        if self.scroll > 0 {
+            self.scroll = (self.scroll + 1).min(self.lines.len().saturating_sub(1));
+        }
+    }
+
+    pub fn container(&self) -> &str {
+        &self.container
+    }
+
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// The lines to show, oldest first, for a window this tall.
+    fn window(&self, height: usize) -> Vec<&String> {
+        let end = self.lines.len().saturating_sub(self.scroll);
+        let start = end.saturating_sub(height);
+        self.lines.range(start..end).collect()
+    }
+}
 pub struct Dashboard {
     projects: Vec<Project>,
     scan_failures: Vec<(PathBuf, String)>,
@@ -152,6 +214,9 @@ pub struct Dashboard {
     /// happening now is what matters, and a backlog of old lines would bury it.
     notice: Option<Notice>,
     help: bool,
+    /// The log being watched, when one is. While it is open it takes the whole
+    /// screen: a log is read, not glanced at beside three other lists.
+    logs: Option<LogView>,
 }
 
 impl Default for Dashboard {
@@ -173,6 +238,7 @@ impl Dashboard {
             tables: Default::default(),
             notice: None,
             help: false,
+            logs: None,
         }
     }
 
@@ -189,6 +255,35 @@ impl Dashboard {
             }
             Update::ServicesFailed(reason) => self.services_error = Some(reason),
             Update::Notice(notice) => self.notice = Some(notice),
+            Update::LogLine { container, line } => {
+                // Only for the log actually open. A stream still winding down
+                // after its view was closed would otherwise feed the next one.
+                if let Some(view) = self.logs.as_mut() {
+                    if view.container == container {
+                        view.push(line);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn open_logs(&mut self, container: String) {
+        self.logs = Some(LogView::new(container));
+    }
+
+    pub fn close_logs(&mut self) {
+        self.logs = None;
+    }
+
+    pub fn logs(&self) -> Option<&LogView> {
+        self.logs.as_ref()
+    }
+
+    /// Moves back through the log, or forward towards the newest line.
+    pub fn scroll_logs(&mut self, delta: isize) {
+        if let Some(view) = self.logs.as_mut() {
+            let furthest = view.lines.len().saturating_sub(1) as isize;
+            view.scroll = (view.scroll as isize - delta).clamp(0, furthest) as usize;
         }
     }
 
@@ -290,6 +385,14 @@ impl Dashboard {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if let Some(view) = &self.logs {
+            draw_logs(frame, view);
+            if self.help {
+                draw_help(frame);
+            }
+            return;
+        }
+
         let [body, status] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
 
@@ -572,7 +675,8 @@ const KEYS: &[(&str, &str)] = &[
     ("S", "restart it"),
     ("o", "open its port in a browser"),
     ("enter", "run the selected project"),
-    ("t", "open a shell in it, on its own toolchain"),
+    ("l", "read the selected service's log"),
+    ("t", "open a shell in a project, on its own toolchain"),
     ("r", "refresh everything"),
     ("?", "this list"),
     ("q", "quit"),
@@ -631,6 +735,55 @@ fn condition_style(service: &ServiceStatus) -> Style {
         (ServiceState::Running, false) => Style::default().fg(paint::WAITING),
         (ServiceState::Stopped, _) => Style::default().fg(paint::MUTED),
     }
+}
+
+/// Draws the log of one service, whole. A log is read rather than glanced at,
+/// so it takes the screen instead of squeezing beside the three lists.
+fn draw_logs(frame: &mut Frame, view: &LogView) {
+    let [body, status] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+
+    let inside = body.height.saturating_sub(2) as usize;
+    let lines: Vec<Line<'static>> = view
+        .window(inside)
+        .into_iter()
+        .map(|line| Line::from(line.clone()))
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_style(Style::default().fg(paint::FOCUS))
+                .padding(Padding::horizontal(1))
+                .title(Span::styled(
+                    format!(" logs · {} ", view.container()),
+                    Style::default()
+                        .fg(paint::FOCUS)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .title_bottom(Span::styled(
+                    if view.is_empty() {
+                        " waiting for output… ".to_string()
+                    } else {
+                        format!(" {} lines ", view.len())
+                    },
+                    Style::default().fg(paint::MUTED),
+                )),
+        ),
+        body,
+    );
+
+    let position = if view.scroll == 0 {
+        Span::styled(" following", Style::default().fg(paint::GOOD))
+    } else {
+        // Said plainly: a log that has stopped moving because the reader
+        // scrolled looks exactly like a service that has gone quiet.
+        Span::styled(
+            format!(" {} lines back — j to follow again", view.scroll),
+            Style::default().fg(paint::WAITING),
+        )
+    };
+    frame.render_widget(Paragraph::new(Line::from(position)), status);
 }
 
 /// Draws the key list over whatever is behind it.
@@ -1123,5 +1276,101 @@ mod tests {
             !overlay.contains("p1"),
             "a row from the list underneath showing through would make both unreadable"
         );
+    }
+
+    #[test]
+    fn a_log_takes_the_whole_screen_rather_than_a_corner_of_it() {
+        let mut dashboard = with_projects(3);
+        with_services(&mut dashboard);
+        assert!(screen(&drawn(&mut dashboard, 120, 20)).contains("Projects"));
+
+        dashboard.open_logs("mysql-1".to_string());
+        let view = screen(&drawn(&mut dashboard, 120, 20));
+        assert!(view.contains("logs · mysql-1"));
+        assert!(
+            !view.contains("PROJECT"),
+            "a log is read, not glanced at beside three other lists"
+        );
+
+        dashboard.close_logs();
+        assert!(screen(&drawn(&mut dashboard, 120, 20)).contains("PROJECT"));
+    }
+
+    #[test]
+    fn lines_from_a_log_that_was_closed_do_not_pour_into_the_next_one() {
+        let mut dashboard = Dashboard::new();
+        dashboard.open_logs("mysql-1".to_string());
+        dashboard.apply(Update::LogLine {
+            container: "redis-1".to_string(),
+            line: "from the wrong container".to_string(),
+        });
+        dashboard.apply(Update::LogLine {
+            container: "mysql-1".to_string(),
+            line: "ready for connections".to_string(),
+        });
+
+        let view = screen(&drawn(&mut dashboard, 120, 20));
+        assert!(view.contains("ready for connections"));
+        assert!(
+            !view.contains("from the wrong container"),
+            "a stream still winding down would otherwise feed the log after it"
+        );
+    }
+
+    #[test]
+    fn a_log_keeps_a_bounded_history_rather_than_growing_forever() {
+        let mut dashboard = Dashboard::new();
+        dashboard.open_logs("chatty".to_string());
+        for index in 0..2500 {
+            dashboard.apply(Update::LogLine {
+                container: "chatty".to_string(),
+                line: format!("line {index}"),
+            });
+        }
+        assert_eq!(
+            dashboard.logs().map(|view| view.len()),
+            Some(2000),
+            "a container writing thousands of lines a second must not exhaust memory"
+        );
+    }
+
+    #[test]
+    fn scrolling_back_holds_its_place_while_new_lines_arrive() {
+        let mut dashboard = Dashboard::new();
+        dashboard.open_logs("app".to_string());
+        for index in 0..50 {
+            dashboard.apply(Update::LogLine {
+                container: "app".to_string(),
+                line: format!("line {index}"),
+            });
+        }
+
+        dashboard.scroll_logs(-20);
+        let before = screen(&drawn(&mut dashboard, 120, 12));
+        assert!(
+            before.contains("lines back"),
+            "the view says it is not following"
+        );
+
+        dashboard.apply(Update::LogLine {
+            container: "app".to_string(),
+            line: "line 50".to_string(),
+        });
+        assert!(
+            !screen(&drawn(&mut dashboard, 120, 12)).contains("line 50"),
+            "a reader who scrolled back should not be yanked to the bottom"
+        );
+    }
+
+    #[test]
+    fn following_is_the_default_and_says_so() {
+        let mut dashboard = Dashboard::new();
+        dashboard.open_logs("app".to_string());
+        dashboard.apply(Update::LogLine {
+            container: "app".to_string(),
+            line: "started".to_string(),
+        });
+        let view = screen(&drawn(&mut dashboard, 120, 12));
+        assert!(view.contains("following") && view.contains("started"));
     }
 }

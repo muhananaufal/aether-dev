@@ -23,15 +23,25 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// The commands, ordered so the list reads as a description of the tool
+/// rather than as the order they happened to be written in: the dashboard
+/// first, then looking, then changing, then working inside a project, then
+/// the two areas with their own subcommands.
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
-    /// List projects with their stack and git status.
+    /// Open the dashboard.
+    #[command(display_order = 1)]
+    Tui,
+
+    /// List projects with their framework, branch and uncommitted changes.
+    #[command(display_order = 2)]
     Scan {
         /// Emit JSON instead of a table, for scripts.
         #[arg(long)]
         json: bool,
     },
-    /// Show the state of the containers defined by the compose file.
+    /// Show what each container is doing, and whether it can be used yet.
+    #[command(display_order = 3)]
     Services {
         #[arg(long)]
         json: bool,
@@ -41,64 +51,14 @@ pub enum Command {
         #[arg(long)]
         memory: bool,
     },
-    /// Show which service ports are answering.
+    /// List every port being listened on, and what is holding it.
+    #[command(display_order = 4)]
     Ports {
         #[arg(long)]
         json: bool,
     },
-    /// Dump and restore databases.
-    #[command(subcommand)]
-    Db(DbCommand),
-    /// Manage the local reverse-proxy hostnames.
-    #[command(subcommand)]
-    Domains(DomainCommand),
-    /// Start services that already exist but are stopped.
-    ///
-    /// This starts existing containers. A service the compose file defines but
-    /// that has never been created has no container to start, and is reported
-    /// as such rather than silently skipped.
-    Start {
-        #[arg(required_unless_present = "all")]
-        services: Vec<String>,
-        /// Every service that has a container, rather than naming them.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Stop running services, leaving their containers in place.
-    Stop {
-        #[arg(required_unless_present = "all")]
-        services: Vec<String>,
-        #[arg(long)]
-        all: bool,
-    },
-    /// Restart services.
-    Restart {
-        #[arg(required_unless_present = "all")]
-        services: Vec<String>,
-        #[arg(long)]
-        all: bool,
-    },
-    /// Show which .env a project is running with, or switch it.
-    Dotenv {
-        project: String,
-        /// The file to copy over .env. The one being replaced is kept as
-        /// .env.bak, so a switch can be undone.
-        #[arg(long = "use", value_name = "FILE")]
-        use_file: Option<String>,
-    },
-    /// Open a service or a project in a browser.
-    Open {
-        /// A service name, or a project name — services are looked at first.
-        target: String,
-    },
-    /// End whatever is holding a port.
-    Kill {
-        port: u16,
-        /// Say what would be ended, without ending it.
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Follow what a service is writing.
+    #[command(display_order = 5)]
     Logs {
         /// Service or container to read.
         service: String,
@@ -109,25 +69,56 @@ pub enum Command {
         #[arg(long, short)]
         tail: Option<u32>,
     },
-    /// Start a project, with its own toolchain in front on PATH and the dev
-    /// command its kind of project uses.
+
+    /// Start services that already exist but are stopped.
+    ///
+    /// This starts existing containers. A service the compose file defines but
+    /// that has never been created has no container to start, and is reported
+    /// as such rather than silently skipped.
+    #[command(display_order = 6)]
+    Start {
+        #[arg(required_unless_present = "all")]
+        services: Vec<String>,
+        /// Every service that has a container, rather than naming them.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Stop running services, leaving their containers in place.
+    #[command(display_order = 7)]
+    Stop {
+        #[arg(required_unless_present = "all")]
+        services: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Restart services.
+    #[command(display_order = 8)]
+    Restart {
+        #[arg(required_unless_present = "all")]
+        services: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// End whatever is holding a port.
+    #[command(display_order = 9)]
+    Kill {
+        port: u16,
+        /// Say what would be ended, without ending it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Start a project, on its own toolchain and with the command its kind of
+    /// project is started by.
+    #[command(display_order = 10)]
     Run {
         project: String,
         /// Say what would run, and on which port, without running it.
         #[arg(long)]
         print: bool,
     },
-    /// Show which toolchain versions a project resolves to, and why.
-    Env { project: String },
-    /// Run a command with the project's toolchain in front on PATH.
-    Exec {
-        project: String,
-        /// Everything after `--`. Taken whole so the command's own flags are
-        /// never mistaken for this tool's.
-        #[arg(last = true, required = true)]
-        command: Vec<String>,
-    },
-    /// Start a shell with the project's toolchain in front on PATH.
+    /// Start a shell in a project, with its toolchain in front on PATH.
+    #[command(display_order = 11)]
     Shell {
         project: String,
         /// Which shell to start. Without this, SHELL is used on unix and
@@ -135,8 +126,40 @@ pub enum Command {
         #[arg(long)]
         shell: Option<String>,
     },
-    /// Open the interactive dashboard.
-    Tui,
+    /// Run one command in a project, with its toolchain in front on PATH.
+    #[command(display_order = 12)]
+    Exec {
+        project: String,
+        /// Everything after `--`. Taken whole so the command's own flags are
+        /// never mistaken for this tool's.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Show which toolchain versions a project resolves to, and why.
+    #[command(display_order = 13)]
+    Env { project: String },
+    /// Show which .env a project is running with, or switch it.
+    #[command(display_order = 14)]
+    Dotenv {
+        project: String,
+        /// The file to copy over .env. The one being replaced is kept as
+        /// .env.bak, so a switch can be undone.
+        #[arg(long = "use", value_name = "FILE")]
+        use_file: Option<String>,
+    },
+    /// Open a service or a project in a browser.
+    #[command(display_order = 15)]
+    Open {
+        /// A service name, or a project name — services are looked at first.
+        target: String,
+    },
+
+    /// Dump and restore databases.
+    #[command(subcommand, display_order = 16)]
+    Db(DbCommand),
+    /// Manage the local reverse-proxy hostnames.
+    #[command(subcommand, display_order = 17)]
+    Domains(DomainCommand),
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

@@ -24,7 +24,9 @@ use serde::Serialize;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Prints a line, treating a reader that walked away the way every other
@@ -417,6 +419,9 @@ fn tui(config: &Config) -> ExitCode {
     let mut dashboard = Dashboard::new();
     let (updates, incoming) = mpsc::channel();
     spawn_collectors(config, updates.clone());
+    // Held so closing the view can unwind the reader, which is otherwise
+    // blocked waiting for a line that may never come.
+    let mut watching: Option<Arc<AtomicBool>> = None;
 
     let outcome: std::io::Result<Leave> = ratatui::run(|terminal| {
         loop {
@@ -440,8 +445,39 @@ fn tui(config: &Config) -> ExitCode {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // A log takes the screen, so it takes the keys too. Leaving the
+            // pane keys live behind it would move a list nobody can see.
+            if dashboard.logs().is_some() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('l') => {
+                        if let Some(stop) = watching.take() {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        dashboard.close_logs();
+                    }
+                    KeyCode::Char('?') => dashboard.toggle_help(),
+                    KeyCode::Char('j') | KeyCode::Down => dashboard.scroll_logs(1),
+                    KeyCode::Char('k') | KeyCode::Up => dashboard.scroll_logs(-1),
+                    KeyCode::PageDown => dashboard.scroll_logs(10),
+                    KeyCode::PageUp => dashboard.scroll_logs(-10),
+                    _ => {}
+                }
+                continue;
+            }
+
             match key.code {
                 KeyCode::Char('?') => dashboard.toggle_help(),
+                KeyCode::Char('l') => match dashboard.selected_service() {
+                    Some(service) => {
+                        let container = service.container.clone();
+                        watching =
+                            Some(spawn_log_stream(config, container.clone(), updates.clone()));
+                        dashboard.open_logs(container);
+                    }
+                    None => dashboard.apply(Update::Notice(Notice::failed(
+                        "l reads a service's log — move to the services or ports pane first",
+                    ))),
+                },
                 // Esc closes the key list when it is open, and only quits when
                 // there is nothing left to close.
                 KeyCode::Esc if dashboard.showing_help() => dashboard.toggle_help(),
@@ -1691,4 +1727,87 @@ fn dotenv(config: &Config, project: &str, use_file: Option<&str>) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Turns a container's output into lines on the dashboard as they arrive.
+///
+/// A writer rather than a buffer, because the log reader hands bytes to
+/// whatever it is given and a following log never ends: collecting it first
+/// would mean showing nothing until it did.
+struct LogSink {
+    container: String,
+    updates: Sender<Update>,
+    stop: Arc<AtomicBool>,
+    partial: Vec<u8>,
+}
+
+impl Write for LogSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.stop.load(Ordering::Relaxed) {
+            // The view was closed. Failing here is what unwinds the reader,
+            // which is otherwise blocked waiting for a line that may never come.
+            return Err(std::io::Error::other("log closed"));
+        }
+        self.partial.extend_from_slice(bytes);
+
+        while let Some(at) = self.partial.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.partial.drain(..=at).collect();
+            let text = String::from_utf8_lossy(&line).trim_end().to_string();
+            if self
+                .updates
+                .send(Update::LogLine {
+                    container: self.container.clone(),
+                    line: text,
+                })
+                .is_err()
+            {
+                return Err(std::io::Error::other("nobody is reading"));
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Follows a container's log on its own thread, until the returned flag is set.
+fn spawn_log_stream(
+    config: &Config,
+    container: String,
+    updates: Sender<Update>,
+) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let endpoint = config.docker.endpoint.clone();
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    let flag = Arc::clone(&stop);
+
+    std::thread::spawn(move || {
+        let client = match HttpDockerClient::new(&endpoint, docker_host.as_deref()) {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = updates.send(Update::Notice(Notice::failed(error.to_string())));
+                return;
+            }
+        };
+        // Asked rather than guessed: a container with a terminal sends one raw
+        // stream and one without sends the multiplexed pair.
+        let framed = client.inspect(&container).map(|d| !d.tty).unwrap_or(true);
+
+        let mut sink = LogSink {
+            container: container.clone(),
+            updates: updates.clone(),
+            stop: flag,
+            partial: Vec::new(),
+        };
+        // A few hundred lines of history, then whatever comes next.
+        if let Err(error) = client.logs(&container, true, Some(300), framed, &mut sink) {
+            let _ = updates.send(Update::Notice(Notice::failed(format!(
+                "{container}: {error}"
+            ))));
+        }
+    });
+
+    stop
 }
