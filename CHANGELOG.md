@@ -16,6 +16,23 @@ is chosen: running a legacy project on an interpreter it said it cannot use,
 silently, is the failure this exists to prevent.
 
 
+### Closing the gap with the predecessor
+
+- The dashboard acts as well as shows: start, stop and restart a service, open
+  its port, run a project, open a shell in it. Quick things stay inside on
+  their own thread; anything that wants the terminal gets it once the
+  dashboard has handed it back. `?` lists every key.
+- `ports` reports every listening port on the machine with the process holding
+  it, and `kill <port>` ends that process. Docker only supplies names now — if
+  the daemon is down the ports are still there, and still the question.
+- `start`, `stop` and `restart` take `--all`.
+- `open <service|project>` opens an address in a browser.
+- `dotenv <project>` shows which .env a project runs with and switches between
+  its variants, keeping the replaced one as .env.bak.
+- Not carried across, on purpose: ejecting a drive, and the tray's WSL cache
+  drop. Both are one machine's housekeeping rather than anything this tool can
+  offer somebody else.
+
 ### Running projects
 
 - `adev run <project>` starts a project the way its kind of project is
