@@ -118,6 +118,19 @@ impl ServiceStatus {
     pub fn is_reachable(&self) -> bool {
         self.state == ServiceState::Running && self.port_open
     }
+
+    /// One word for what this service is actually doing. "running" and
+    /// "usable" are deliberately different words: the tool this replaces used
+    /// one word for both and told the user a database was available while it
+    /// was still refusing connections.
+    pub fn condition(&self) -> &'static str {
+        match (self.state, self.port_open, self.port.is_some()) {
+            (ServiceState::Stopped, _, _) => "stopped",
+            (ServiceState::Running, true, _) => "ready",
+            (ServiceState::Running, false, true) => "starting",
+            (ServiceState::Running, false, false) => "running",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,5 +225,44 @@ mod tests {
         assert!(up.is_reachable());
         assert!(!booting.is_reachable());
         assert!(!down.is_reachable());
+    }
+    #[test]
+    fn a_condition_word_separates_running_from_usable() {
+        let base = ServiceStatus {
+            container: "mysql-db".to_string(),
+            service: "mysql".to_string(),
+            port: Some(3306),
+            state: ServiceState::Running,
+            port_open: true,
+            memory_bytes: None,
+        };
+        assert_eq!(base.condition(), "ready");
+        assert_eq!(
+            ServiceStatus {
+                port_open: false,
+                ..base.clone()
+            }
+            .condition(),
+            "starting"
+        );
+        assert_eq!(
+            ServiceStatus {
+                port_open: false,
+                port: None,
+                ..base.clone()
+            }
+            .condition(),
+            "running",
+            "a container with nothing published is running, not stuck starting"
+        );
+        assert_eq!(
+            ServiceStatus {
+                state: ServiceState::Stopped,
+                port_open: false,
+                ..base
+            }
+            .condition(),
+            "stopped"
+        );
     }
 }

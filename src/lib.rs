@@ -12,3 +12,4 @@ pub mod domain;
 pub mod git;
 pub mod ports;
 pub mod scan;
+pub mod tui;
