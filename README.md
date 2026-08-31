@@ -186,8 +186,8 @@ reports.
   but that has never been created has nothing to start, and says so.
 - `--memory` costs about a second and a half per container, which is why the
   listing does not include it by default.
-- The dashboard is monochrome and shows projects, services and ports. Logs
-  and memory are commands only.
+- The dashboard shows projects, services and ports. Logs and memory are
+  commands only.
 - Not carried over from the predecessor, deliberately: opening a folder, an
   editor or Postman. Those were buttons because the old tool was a window; in
   a terminal you are already where `cd` and your editor live.

@@ -344,11 +344,7 @@ fn tui(config: &Config) -> ExitCode {
                 dashboard.apply(update);
             }
 
-            terminal.draw(|frame| {
-                let area = frame.area();
-                let view = dashboard.render(area.width, area.height);
-                frame.render_widget(view.as_str(), area);
-            })?;
+            terminal.draw(|frame| dashboard.draw(frame))?;
 
             if !event::poll(Duration::from_millis(80))? {
                 continue;
