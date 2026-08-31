@@ -99,6 +99,21 @@ pub fn parse_containers(json: &str) -> Result<Vec<ServiceStatus>, DockerError> {
         .collect())
 }
 
+/// Pins the name `localhost` to IPv4.
+///
+/// On Windows the name resolves to ::1 first, and the docker port published
+/// from WSL is bound to 127.0.0.1 only, so every request pays a failed
+/// connection before falling back. Measured on this machine: 2.45s per command
+/// through the name against 0.41s through the address. An address written out
+/// in full is left exactly as given.
+fn prefer_ipv4(host: &str) -> String {
+    match host.split_once(':') {
+        Some(("localhost", port)) => format!("127.0.0.1:{port}"),
+        None if host == "localhost" => "127.0.0.1".to_string(),
+        _ => host.to_string(),
+    }
+}
+
 /// Resolves the configured endpoint into an HTTP base URL, following
 /// `DOCKER_HOST` when the config says `auto` the way other docker clients do.
 pub fn base_url(endpoint: &str, docker_host: Option<&str>) -> Result<String, DockerError> {
@@ -109,8 +124,10 @@ pub fn base_url(endpoint: &str, docker_host: Option<&str>) -> Result<String, Doc
     };
 
     if let Some(host) = endpoint.strip_prefix("tcp://") {
-        Ok(format!("http://{host}"))
-    } else if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        Ok(format!("http://{}", prefer_ipv4(host)))
+    } else if let Some(host) = endpoint.strip_prefix("http://") {
+        Ok(format!("http://{}", prefer_ipv4(host)))
+    } else if endpoint.starts_with("https://") {
         Ok(endpoint.to_string())
     } else {
         Err(DockerError::UnsupportedTransport(endpoint.to_string()))
@@ -496,8 +513,8 @@ mod tests {
             "http://127.0.0.1:2375"
         );
         assert_eq!(
-            base_url("http://localhost:2375", None).unwrap(),
-            "http://localhost:2375"
+            base_url("http://docker.internal:2375", None).unwrap(),
+            "http://docker.internal:2375"
         );
     }
 
@@ -505,7 +522,7 @@ mod tests {
     fn auto_follows_docker_host_the_way_every_other_docker_client_does() {
         assert_eq!(
             base_url("auto", Some("tcp://localhost:2375")).unwrap(),
-            "http://localhost:2375"
+            "http://127.0.0.1:2375"
         );
     }
 
@@ -645,5 +662,37 @@ mod tests {
         let mut stdout = Vec::new();
         let stderr = demux_into(&mut std::io::Cursor::new(Vec::new()), &mut stdout).unwrap();
         assert!(stdout.is_empty() && stderr.is_empty());
+    }
+
+    #[test]
+    fn localhost_is_pinned_to_ipv4_because_the_ipv6_attempt_costs_seconds() {
+        // Measured on this machine: 2.45s through "localhost" against 0.41s
+        // through 127.0.0.1, because the name resolves to ::1 first and the
+        // published port is only on IPv4.
+        assert_eq!(
+            base_url("tcp://localhost:2375", None).unwrap(),
+            "http://127.0.0.1:2375"
+        );
+        assert_eq!(
+            base_url("auto", Some("tcp://localhost:2375")).unwrap(),
+            "http://127.0.0.1:2375"
+        );
+    }
+
+    #[test]
+    fn an_address_written_out_in_full_is_left_alone() {
+        assert_eq!(
+            base_url("tcp://[::1]:2375", None).unwrap(),
+            "http://[::1]:2375"
+        );
+        assert_eq!(
+            base_url("tcp://192.168.1.5:2375", None).unwrap(),
+            "http://192.168.1.5:2375"
+        );
+        assert_eq!(
+            base_url("tcp://localhostings:2375", None).unwrap(),
+            "http://localhostings:2375",
+            "only the name localhost itself is redirected, not anything containing it"
+        );
     }
 }
