@@ -118,6 +118,19 @@ pub enum Update {
     },
 }
 
+/// A box laid over the screen: a list of labelled values with a title.
+///
+/// The settings screen was the first of these and is now one of three, along
+/// with a project's toolchains and the routed hostnames. Anything that is read
+/// rather than acted on belongs here instead of in a fourth pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detail {
+    pub title: String,
+    pub lines: Vec<(String, String)>,
+    /// What to press to leave, and where to go to change what is shown.
+    pub hint: String,
+}
+
 /// A line about something the user just asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
@@ -230,7 +243,11 @@ pub struct Dashboard {
     /// dashboard never reads configuration itself: it shows what it is told,
     /// which keeps it free of anything that touches a file.
     settings: Vec<(String, String)>,
-    showing_settings: bool,
+    /// What is laid over the screen, when anything is.
+    detail: Option<Detail>,
+    /// A destructive action waiting for a yes. It takes the status line so it
+    /// cannot be answered by a keystroke meant for something else.
+    confirm: Option<String>,
     /// What the container host is costing this machine. Polled on its own
     /// timer, so a slow probe cannot hold up the rest of the screen.
     memory: memory::Reading,
@@ -259,7 +276,8 @@ impl Dashboard {
             help: false,
             logs: None,
             settings: Vec::new(),
-            showing_settings: false,
+            detail: None,
+            confirm: None,
             memory: memory::Reading::default(),
             ports: Vec::new(),
             ports_error: None,
@@ -323,12 +341,44 @@ impl Dashboard {
         self.settings = settings;
     }
 
+    /// Shows the settings, which are the one overlay the dashboard can build
+    /// for itself because it was handed the lines at startup.
     pub fn toggle_settings(&mut self) {
-        self.showing_settings = !self.showing_settings;
+        if self.detail.is_some() {
+            self.detail = None;
+            return;
+        }
+        self.detail = Some(Detail {
+            title: "Settings".to_string(),
+            lines: self.settings.clone(),
+            hint: "adev config --edit to change · esc to close".to_string(),
+        });
     }
 
-    pub fn showing_settings(&self) -> bool {
-        self.showing_settings
+    pub fn show_detail(&mut self, detail: Detail) {
+        self.detail = Some(detail);
+    }
+
+    pub fn close_detail(&mut self) {
+        self.detail = None;
+    }
+
+    pub fn showing_detail(&self) -> bool {
+        self.detail.is_some()
+    }
+
+    /// Asks a yes-or-no question that must be answered before anything else
+    /// happens. Only for actions that cannot be undone.
+    pub fn ask(&mut self, question: impl Into<String>) {
+        self.confirm = Some(question.into());
+    }
+
+    pub fn confirming(&self) -> Option<&str> {
+        self.confirm.as_deref()
+    }
+
+    pub fn dismiss(&mut self) {
+        self.confirm = None;
     }
 
     pub fn toggle_help(&mut self) {
@@ -480,8 +530,8 @@ impl Dashboard {
     /// Whatever is layered over the screen. Settings first, so the key list
     /// opened on top of it is the one that closes first.
     fn draw_overlays(&self, frame: &mut Frame) {
-        if self.showing_settings {
-            draw_settings(frame, &self.settings);
+        if let Some(detail) = &self.detail {
+            draw_detail(frame, detail);
         }
         if self.help {
             draw_help(frame);
@@ -682,6 +732,14 @@ impl Dashboard {
     }
 
     fn status_line(&self) -> Paragraph<'static> {
+        // A question outranks everything. A collector finishing at the wrong
+        // moment must not push it off the line the answer is typed at.
+        if let Some(question) = &self.confirm {
+            return Paragraph::new(Line::from(Span::styled(
+                format!(" {question}  [y/N] "),
+                Style::default().fg(paint::BAD).add_modifier(Modifier::BOLD),
+            )));
+        }
         // What just happened takes the line while it is fresh. The counts are
         // still on every pane's frame, so nothing is actually lost.
         if let Some(notice) = &self.notice {
@@ -775,6 +833,9 @@ const KEYS: &[(&str, &str)] = &[
     ("t", "open a shell in a project, on its own toolchain"),
     ("e", "open the selected project's folder"),
     ("b", "back up the selected service's databases"),
+    ("K", "end what holds the selected port"),
+    ("v", "the toolchain versions a project resolves to"),
+    ("d", "the hostnames the proxy serves"),
     ("r", "refresh this pane"),
     ("R", "refresh everything"),
     ("g", "the settings in force, and where they live"),
@@ -898,12 +959,13 @@ fn draw_logs(frame: &mut Frame, view: &LogView) {
 /// each choice, and rewriting it from a form would throw those away every time
 /// somebody changed a number - so this says what is in force and where to go
 /// and change it.
-fn draw_settings(frame: &mut Frame, lines: &[(String, String)]) {
+fn draw_detail(frame: &mut Frame, detail: &Detail) {
     let width = 74;
-    let height = (lines.len() as u16 + 2).min(frame.area().height);
+    let height = (detail.lines.len() as u16 + 2).min(frame.area().height);
     let area = centred(frame.area(), width, height);
 
-    let rows: Vec<Row<'static>> = lines
+    let rows: Vec<Row<'static>> = detail
+        .lines
         .iter()
         .map(|(key, value)| {
             Row::new(vec![
@@ -921,13 +983,13 @@ fn draw_settings(frame: &mut Frame, lines: &[(String, String)]) {
                     .border_style(Style::default().fg(paint::FOCUS))
                     .padding(Padding::horizontal(1))
                     .title(Span::styled(
-                        " Settings ",
+                        format!(" {} ", detail.title),
                         Style::default()
                             .fg(paint::FOCUS)
                             .add_modifier(Modifier::BOLD),
                     ))
                     .title_bottom(Span::styled(
-                        " adev config --edit to change · g or esc to close ",
+                        format!(" {} ", detail.hint),
                         Style::default().fg(paint::MUTED),
                     )),
             )
@@ -1269,6 +1331,63 @@ mod tests {
             view.contains("2 listening"),
             "the count belongs on the frame; got {view}"
         );
+    }
+
+    #[test]
+    fn a_question_takes_the_status_line_until_it_is_answered() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.apply(Update::Notice(Notice::done("started mysql")));
+        dashboard.ask("kill node.exe (pid 900) on 5173?");
+
+        let footer = lines(&drawn(&mut dashboard, 140, 20)).pop().unwrap();
+        assert!(footer.contains("kill node.exe"), "got {footer:?}");
+        assert!(
+            !footer.contains("started mysql"),
+            "a question that shares its line with an old notice can be answered by accident"
+        );
+        assert_eq!(
+            dashboard.confirming(),
+            Some("kill node.exe (pid 900) on 5173?")
+        );
+
+        dashboard.dismiss();
+        assert_eq!(dashboard.confirming(), None);
+    }
+
+    #[test]
+    fn an_arriving_notice_cannot_replace_a_question_that_is_still_open() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.ask("kill node.exe (pid 900) on 5173?");
+        // A collector finishing at the wrong moment must not turn a pending
+        // "kill this?" into something the next keystroke answers blind.
+        dashboard.apply(Update::Notice(Notice::done("rereading ports")));
+
+        let footer = lines(&drawn(&mut dashboard, 140, 20)).pop().unwrap();
+        assert!(footer.contains("kill node.exe"), "got {footer:?}");
+    }
+
+    #[test]
+    fn a_detail_overlay_carries_its_own_title_and_lines() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.show_detail(Detail {
+            title: "shop-web".to_string(),
+            lines: vec![(
+                "php".to_string(),
+                "7.4.33  asked for by the project".to_string(),
+            )],
+            hint: "esc to close".to_string(),
+        });
+
+        let view = screen(&drawn(&mut dashboard, 140, 24));
+        assert!(view.contains("shop-web"), "the title names what is shown");
+        assert!(view.contains("7.4.33"), "got {view}");
+        assert!(dashboard.showing_detail());
+
+        dashboard.close_detail();
+        assert!(!dashboard.showing_detail());
     }
 
     #[test]

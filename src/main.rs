@@ -19,7 +19,7 @@ use aether_dev::proxy::DomainSet;
 use aether_dev::recipe;
 use aether_dev::scan::FsProjectScanner;
 use aether_dev::toolchain::{self, Reason, Resolution};
-use aether_dev::tui::{Dashboard, Notice, Pane, Update};
+use aether_dev::tui::{Dashboard, Detail, Notice, Pane, Update};
 use clap::Parser;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -471,6 +471,99 @@ fn spawn_service_collector(config: &Config, updates: Sender<Update>) {
     });
 }
 
+/// An action held back until the user says yes.
+///
+/// Only for what cannot be undone. Everything else in the dashboard - start,
+/// stop, open, backup - either reverses or only creates, and asking about
+/// those would teach the habit of pressing y without reading.
+enum Pending {
+    Kill { pid: u32, label: String },
+}
+
+/// Ends a process for the dashboard, then re-reads what is listening: leaving
+/// a row for a process that is gone would be the screen lying about the thing
+/// it was just used to change.
+fn spawn_kill(pid: u32, label: String, updates: Sender<Update>) {
+    std::thread::spawn(move || {
+        let notice = match listen::terminate(pid) {
+            Ok(()) => Notice::done(format!("killed {label}")),
+            Err(error) => Notice::failed(format!("{label}: {error}")),
+        };
+        let _ = updates.send(Update::Notice(notice));
+        if let Ok(listeners) = listen::listening() {
+            let _ = updates.send(Update::Ports(listeners));
+        }
+    });
+}
+
+/// The toolchain versions a project resolves to, as overlay lines.
+fn toolchain_detail(config: &Config, name: &str, path: &Path) -> Detail {
+    let resolved = toolchains_for(config, name, path);
+    let mut lines = Vec::new();
+    if resolved.is_empty() {
+        lines.push((
+            "none".to_string(),
+            "nothing under [toolchain] applies to this project".to_string(),
+        ));
+    }
+    for (tool, resolution) in &resolved {
+        match &resolution.chosen {
+            Some(chosen) => {
+                lines.push((
+                    tool.clone(),
+                    format!("{}  {}", chosen.version, why(resolution.reason)),
+                ));
+                lines.push((String::new(), chosen.path.display().to_string()));
+            }
+            None => lines.push((
+                tool.clone(),
+                format!(
+                    "-  {} ({})",
+                    why(resolution.reason),
+                    resolution.constraint.as_deref().unwrap_or("no constraint")
+                ),
+            )),
+        }
+    }
+    Detail {
+        title: name.to_string(),
+        lines,
+        hint: "esc to close".to_string(),
+    }
+}
+
+/// Every hostname the proxy would serve, as overlay lines.
+fn domain_detail(config: &Config) -> Result<Detail, String> {
+    let set = read_domains(&config.caddy.domains)?;
+    let routes = routes_of(config, &set)?;
+    let from_file: Vec<&str> = set.entries().iter().map(|d| d.host.as_str()).collect();
+
+    let mut lines: Vec<(String, String)> = routes
+        .entries()
+        .iter()
+        .map(|domain| {
+            // Which of the two named it decides where to go to change it.
+            let source = if from_file.contains(&domain.host.as_str()) {
+                String::new()
+            } else {
+                "  (from its service)".to_string()
+            };
+            (domain.host.clone(), format!("{}{source}", domain.upstream))
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push((
+            "none".to_string(),
+            format!("nothing in {}", config.caddy.domains.display()),
+        ));
+    }
+    Ok(Detail {
+        title: "Domains".to_string(),
+        lines,
+        hint: "adev domains add to change · esc to close".to_string(),
+    })
+}
+
 /// Dumps one service's databases for the dashboard, off the draw loop.
 fn spawn_backup(config: &Config, service: ServiceStatus, updates: Sender<Update>) {
     let endpoint = config.docker.endpoint.clone();
@@ -539,6 +632,9 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
     // Held so closing the view can unwind the reader, which is otherwise
     // blocked waiting for a line that may never come.
     let mut watching: Option<Arc<AtomicBool>> = None;
+    // What a yes would carry out. Held here rather than in the dashboard, which
+    // knows nothing about docker or processes and should stay that way.
+    let mut pending: Option<Pending> = None;
     dashboard.set_settings(settings_lines(config, chosen));
 
     let outcome: std::io::Result<Leave> = ratatui::run(|terminal| {
@@ -561,6 +657,25 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
             // Windows sends a press and a release for one keystroke, so without
             // this filter every movement counts twice.
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            // A question outranks every other key. Only an explicit y goes
+            // ahead: anything else, including a stray arrow key, is a no, so
+            // there is no keystroke that destroys something by accident.
+            if dashboard.confirming().is_some() {
+                let yes = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+                dashboard.dismiss();
+                match (yes, pending.take()) {
+                    (true, Some(Pending::Kill { pid, label })) => {
+                        dashboard
+                            .apply(Update::Notice(Notice::working(format!("killing {label}"))));
+                        spawn_kill(pid, label, updates.clone());
+                    }
+                    (true, None) => {}
+                    (false, _) => {
+                        dashboard.apply(Update::Notice(Notice::done("left alone")));
+                    }
+                }
                 continue;
             }
             // A log takes the screen, so it takes the keys too. Leaving the
@@ -600,7 +715,7 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                 // Esc closes the key list when it is open, and only quits when
                 // there is nothing left to close.
                 KeyCode::Esc if dashboard.showing_help() => dashboard.toggle_help(),
-                KeyCode::Esc if dashboard.showing_settings() => dashboard.toggle_settings(),
+                KeyCode::Esc if dashboard.showing_detail() => dashboard.close_detail(),
                 KeyCode::Char('q') | KeyCode::Esc => break Ok(Leave::Quit),
                 KeyCode::Tab | KeyCode::Right => dashboard.focus_next(),
                 KeyCode::BackTab | KeyCode::Left => dashboard.focus_previous(),
@@ -709,6 +824,44 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                     ))),
                 },
 
+                // Ending a process is the one thing here that cannot be undone,
+                // so it asks first and names what it is about to end.
+                KeyCode::Char('K') => {
+                    let target = dashboard
+                        .selected_port()
+                        .and_then(|l| l.pid.map(|pid| (pid, l.port, l.process.clone())));
+                    match target {
+                        Some((pid, port, process)) => {
+                            let label = format!(
+                                "{} (pid {pid}) on {port}",
+                                process.unwrap_or_else(|| "that process".to_string())
+                            );
+                            dashboard.ask(format!("kill {label}?"));
+                            pending = Some(Pending::Kill { pid, label });
+                        }
+                        None => dashboard.apply(Update::Notice(Notice::failed(
+                            "K ends what holds a port — move to the ports pane first",
+                        ))),
+                    }
+                }
+
+                // Which versions this project resolves to, and why.
+                KeyCode::Char('v') => match dashboard.selected_project() {
+                    Some(project) => {
+                        let detail = toolchain_detail(config, &project.name, &project.path);
+                        dashboard.show_detail(detail);
+                    }
+                    None => dashboard.apply(Update::Notice(Notice::failed(
+                        "v shows a project's toolchains — move to the projects pane first",
+                    ))),
+                },
+
+                // Every hostname the proxy would serve, from both sources.
+                KeyCode::Char('d') => match domain_detail(config) {
+                    Ok(detail) => dashboard.show_detail(detail),
+                    Err(reason) => dashboard.apply(Update::Notice(Notice::failed(reason))),
+                },
+
                 // The project's directory, in whatever this machine uses to
                 // look at directories.
                 KeyCode::Char('e') => {
@@ -757,20 +910,27 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
     }
 }
 
-/// Reads the domains file. A file that is not there yet is an empty set, not a
-/// failure: nothing has been routed, which is a valid state to start from.
-fn load_domains(path: &Path) -> Result<DomainSet, ExitCode> {
+/// Reads the domains file without printing anything. A file that is not there
+/// yet is an empty set, not a failure: nothing has been routed, which is a
+/// valid state to start from.
+///
+/// Silent because the dashboard needs it too, and it runs on the alternate
+/// screen where a line on stderr lands on top of the drawing.
+fn read_domains(path: &Path) -> Result<DomainSet, String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => DomainSet::from_toml_str(&text).map_err(|error| {
-            eprintln!("adev: {}: {error}", path.display());
-            ExitCode::from(2)
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DomainSet::default()),
-        Err(error) => {
-            eprintln!("adev: cannot read {}: {error}", path.display());
-            Err(ExitCode::from(2))
+        Ok(text) => {
+            DomainSet::from_toml_str(&text).map_err(|error| format!("{}: {error}", path.display()))
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DomainSet::default()),
+        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
     }
+}
+
+fn load_domains(path: &Path) -> Result<DomainSet, ExitCode> {
+    read_domains(path).map_err(|reason| {
+        eprintln!("adev: {reason}");
+        ExitCode::from(2)
+    })
 }
 
 /// Writes the source of truth first, then the file generated from it. In that
@@ -783,23 +943,27 @@ fn load_domains(path: &Path) -> Result<DomainSet, ExitCode> {
 /// stays a fact about that service instead of being copied into an artefact
 /// that would then disagree with it. A host claimed by both is refused, which
 /// is the same answer the file gives when it names one host twice.
-fn all_routes(config: &Config, set: &DomainSet) -> Result<DomainSet, ExitCode> {
-    let declared = catalog::service_domains(&config.services_declared()).map_err(|error| {
-        eprintln!("adev: {error}");
-        ExitCode::from(2)
-    })?;
+fn routes_of(config: &Config, set: &DomainSet) -> Result<DomainSet, String> {
+    let declared =
+        catalog::service_domains(&config.services_declared()).map_err(|error| error.to_string())?;
 
     let mut merged = set.clone();
     for (host, upstream) in declared {
         if let Err(error) = merged.add(&host, &upstream) {
-            eprintln!(
-                "adev: {error} — {host} is named both by a service and in {}",
+            return Err(format!(
+                "{error} — {host} is named both by a service and in {}",
                 config.caddy.domains.display()
-            );
-            return Err(ExitCode::from(2));
+            ));
         }
     }
     Ok(merged)
+}
+
+fn all_routes(config: &Config, set: &DomainSet) -> Result<DomainSet, ExitCode> {
+    routes_of(config, set).map_err(|reason| {
+        eprintln!("adev: {reason}");
+        ExitCode::from(2)
+    })
 }
 
 fn save_domains(config: &Config, set: &DomainSet, no_reload: bool) -> ExitCode {
