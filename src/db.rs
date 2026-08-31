@@ -175,6 +175,83 @@ fn validated_database(database: &str) -> Result<String, DbError> {
     Ok(database.to_string())
 }
 
+/// Builds the restore command for one database.
+///
+/// The database name and the file path travel as their own arguments to `sh`,
+/// never spliced into the script text, so neither can be read as part of the
+/// command however it is spelled.
+pub fn restore_plan(
+    engine: Engine,
+    database: &str,
+    file: &str,
+    container_env: &[String],
+) -> Result<ExecPlan, DbError> {
+    let database = validated_database(database)?;
+
+    let (script, mut args, env) = match engine {
+        Engine::MySql => {
+            let password = value_of(container_env, "MYSQL_ROOT_PASSWORD").ok_or(
+                DbError::MissingCredential {
+                    container: "mysql",
+                    variable: "MYSQL_ROOT_PASSWORD",
+                },
+            )?;
+            (
+                "mysql --user=root \"$1\" < \"$2\"",
+                vec![database],
+                vec![format!("MYSQL_PWD={password}")],
+            )
+        }
+        Engine::Postgres => {
+            let user =
+                value_of(container_env, "POSTGRES_USER").ok_or(DbError::MissingCredential {
+                    container: "postgres",
+                    variable: "POSTGRES_USER",
+                })?;
+            let password =
+                value_of(container_env, "POSTGRES_PASSWORD").ok_or(DbError::MissingCredential {
+                    container: "postgres",
+                    variable: "POSTGRES_PASSWORD",
+                })?;
+            (
+                "psql --username=\"$1\" --dbname=\"$2\" --file=\"$3\" --set ON_ERROR_STOP=1",
+                vec![user, database],
+                vec![format!("PGPASSWORD={password}")],
+            )
+        }
+        Engine::Mongo => {
+            let user = value_of(container_env, "MONGO_INITDB_ROOT_USERNAME").ok_or(
+                DbError::MissingCredential {
+                    container: "mongo",
+                    variable: "MONGO_INITDB_ROOT_USERNAME",
+                },
+            )?;
+            let password = value_of(container_env, "MONGO_INITDB_ROOT_PASSWORD").ok_or(
+                DbError::MissingCredential {
+                    container: "mongo",
+                    variable: "MONGO_INITDB_ROOT_PASSWORD",
+                },
+            )?;
+            (
+                "mongorestore --username=\"$1\" --password=\"$2\" \
+                 --authenticationDatabase=admin --db=\"$3\" --archive=\"$4\"",
+                vec![user, password, database],
+                Vec::new(),
+            )
+        }
+    };
+
+    // "sh" fills $0; the real arguments start at $1.
+    let mut command = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+        "sh".to_string(),
+    ];
+    command.append(&mut args);
+    command.push(file.to_string());
+    Ok(ExecPlan { command, env })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +383,53 @@ mod tests {
         assert!(
             plan.env.contains(&"MYSQL_PWD=a=b=c".to_string()),
             "splitting on every equals sign would truncate the password"
+        );
+    }
+    #[test]
+    fn a_mysql_restore_passes_the_database_and_file_as_separate_arguments() {
+        let plan = restore_plan(Engine::MySql, "shop", "/tmp/dump.sql", &mysql_env()).unwrap();
+        assert_eq!(plan.command[0], "sh");
+        assert_eq!(plan.command[1], "-c");
+        assert!(
+            plan.command.contains(&"shop".to_string())
+                && plan.command.contains(&"/tmp/dump.sql".to_string()),
+            "the name and the path travel as their own arguments, so neither can be 
+             read as part of the script"
+        );
+        assert!(!plan.command.iter().any(|arg| arg.contains("s3cr3t")));
+        assert!(plan.env.contains(&"MYSQL_PWD=s3cr3t".to_string()));
+    }
+
+    #[test]
+    fn a_postgres_restore_uses_the_containers_own_user() {
+        let plan =
+            restore_plan(Engine::Postgres, "tickets", "/tmp/d.sql", &postgres_env()).unwrap();
+        assert_eq!(plan.command[0], "sh");
+        assert!(plan.command.contains(&"ticket".to_string()));
+        assert!(plan.command.contains(&"tickets".to_string()));
+        assert!(plan.env.contains(&"PGPASSWORD=p4ss".to_string()));
+    }
+
+    #[test]
+    fn a_mongo_restore_reads_the_archive_it_was_given() {
+        let plan = restore_plan(Engine::Mongo, "events", "/tmp/d.archive", &mongo_env()).unwrap();
+        assert!(plan.command.iter().any(|arg| arg.contains("mongorestore")));
+        assert!(plan.command.contains(&"/tmp/d.archive".to_string()));
+    }
+
+    #[test]
+    fn a_restore_refuses_the_same_database_names_a_dump_does() {
+        let err =
+            restore_plan(Engine::MySql, "shop; drop", "/tmp/d.sql", &mysql_env()).unwrap_err();
+        assert!(matches!(err, DbError::InvalidDatabase(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_restore_without_credentials_is_refused_rather_than_attempted() {
+        let err = restore_plan(Engine::Postgres, "t", "/tmp/d.sql", &[]).unwrap_err();
+        assert!(
+            matches!(err, DbError::MissingCredential { .. }),
+            "got {err:?}"
         );
     }
 }
