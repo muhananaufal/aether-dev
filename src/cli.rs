@@ -66,6 +66,10 @@ pub enum DbCommand {
         /// Compress the dump with gzip.
         #[arg(long)]
         gzip: bool,
+        /// Overwrite the destination if it already exists. Without this an
+        /// existing file is left alone, because it is somebody's backup.
+        #[arg(long)]
+        force: bool,
     },
     /// Load a dump file into a database.
     Import {
@@ -149,6 +153,7 @@ mod tests {
                 database: "shop".to_string(),
                 out: PathBuf::from("shop.sql"),
                 gzip: false,
+                force: false,
             })
         );
     }
@@ -242,5 +247,43 @@ mod tests {
                 no_reload: true,
             })
         );
+    }
+    #[test]
+    fn an_export_refuses_to_overwrite_unless_told_to() {
+        let plain = Cli::parse_from([
+            "adev",
+            "db",
+            "export",
+            "mysql",
+            "--database",
+            "shop",
+            "--out",
+            "shop.sql",
+        ]);
+        assert_eq!(
+            plain.command,
+            Command::Db(DbCommand::Export {
+                service: "mysql".to_string(),
+                database: "shop".to_string(),
+                out: PathBuf::from("shop.sql"),
+                gzip: false,
+                force: false,
+            })
+        );
+        let forced = Cli::parse_from([
+            "adev",
+            "db",
+            "export",
+            "mysql",
+            "--database",
+            "shop",
+            "--out",
+            "shop.sql",
+            "--force",
+        ]);
+        assert!(matches!(
+            forced.command,
+            Command::Db(DbCommand::Export { force: true, .. })
+        ));
     }
 }

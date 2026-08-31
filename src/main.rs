@@ -1,8 +1,9 @@
 //! The `adev` command.
 
-use aether_dev::cli::{Cli, Command, DomainCommand};
+use aether_dev::cli::{Cli, Command, DbCommand, DomainCommand};
 use aether_dev::config::Config;
-use aether_dev::docker::{probe_all, DockerClient, HttpDockerClient};
+use aether_dev::db::{dump_plan, Engine};
+use aether_dev::docker::{probe_all, DockerClient, DockerError, HttpDockerClient};
 use aether_dev::domain::{Project, ServiceStatus};
 use aether_dev::git::GitCli;
 use aether_dev::ports::ScanEvent;
@@ -11,9 +12,11 @@ use aether_dev::proxy::DomainSet;
 use aether_dev::scan::FsProjectScanner;
 use aether_dev::tui::{Dashboard, Tab, Update};
 use clap::Parser;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use serde::Serialize;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Sender};
@@ -48,7 +51,7 @@ fn main() -> ExitCode {
         Command::Scan { json } => scan(&config, json),
         Command::Services { json } => services(&config, json),
         Command::Ports { json } => ports(&config, json),
-        Command::Db(_) => not_built_yet("db"),
+        Command::Db(command) => db(&config, command),
         Command::Domains(command) => domains(&config, command),
         Command::Tui => tui(&config),
     }
@@ -448,4 +451,149 @@ fn domains(config: &Config, command: DomainCommand) -> ExitCode {
             save_domains(config, &set, no_reload)
         }
     }
+}
+
+/// Finds the container behind a compose service name, accepting the container
+/// name too since that is what `docker ps` shows and what people often type.
+fn container_for(client: &HttpDockerClient, service: &str) -> Result<String, ExitCode> {
+    let services = client.services().map_err(|error| {
+        eprintln!("adev: {error}");
+        ExitCode::from(2)
+    })?;
+
+    services
+        .iter()
+        .find(|candidate| candidate.service == service || candidate.container == service)
+        .map(|found| found.container.clone())
+        .ok_or_else(|| {
+            let known: Vec<&str> = services.iter().map(|s| s.service.as_str()).collect();
+            eprintln!(
+                "adev: no service called {service:?}; known: {}",
+                known.join(", ")
+            );
+            ExitCode::from(2)
+        })
+}
+
+fn db(config: &Config, command: DbCommand) -> ExitCode {
+    match command {
+        DbCommand::Export {
+            service,
+            database,
+            out,
+            gzip,
+            force,
+        } => export(config, &service, &database, &out, gzip, force),
+        DbCommand::Import { .. } => not_built_yet("db import"),
+    }
+}
+
+fn export(
+    config: &Config,
+    service: &str,
+    database: &str,
+    out: &Path,
+    gzip: bool,
+    force: bool,
+) -> ExitCode {
+    if out.exists() && !force {
+        eprintln!(
+            "adev: {} already exists; pass --force to replace it",
+            out.display()
+        );
+        return ExitCode::from(2);
+    }
+
+    let client = match docker_client(config) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let container = match container_for(&client, service) {
+        Ok(container) => container,
+        Err(code) => return code,
+    };
+
+    let detail = match client.inspect(&container) {
+        Ok(detail) => detail,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(engine) = Engine::from_image(&detail.image) else {
+        eprintln!(
+            "adev: {container} runs {}, which is not a database this build knows how to dump",
+            detail.image
+        );
+        return ExitCode::from(2);
+    };
+    let plan = match dump_plan(engine, database, &detail.env) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let file = match std::fs::File::create(out) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("adev: cannot write {}: {error}", out.display());
+            return ExitCode::from(2);
+        }
+    };
+    let mut sink = BufWriter::new(file);
+
+    let started = Instant::now();
+    let outcome = if gzip {
+        let mut encoder = GzEncoder::new(&mut sink, Compression::default());
+        let outcome = client.exec(&container, &plan.command, &plan.env, &mut encoder);
+        outcome.and_then(|outcome| {
+            encoder
+                .finish()
+                .map(|_| outcome)
+                .map_err(|error| DockerError::Malformed(error.to_string()))
+        })
+    } else {
+        client.exec(&container, &plan.command, &plan.env, &mut sink)
+    };
+
+    let outcome = match outcome.and_then(|outcome| {
+        sink.flush()
+            .map(|()| outcome)
+            .map_err(|error| DockerError::Malformed(error.to_string()))
+    }) {
+        Ok(outcome) => outcome,
+        Err(error) => return abandon(out, &format!("{error}")),
+    };
+
+    if outcome.exit_code != 0 {
+        // A half written dump that looks like a backup is worse than no dump,
+        // so the file goes rather than being left for someone to trust later.
+        let reason = String::from_utf8_lossy(&outcome.stderr).trim().to_string();
+        return abandon(
+            out,
+            &format!("{} exited {}: {reason}", plan.command[0], outcome.exit_code),
+        );
+    }
+
+    let bytes = std::fs::metadata(out).map(|meta| meta.len()).unwrap_or(0);
+    if !outcome.stderr.is_empty() {
+        // Warnings are not failures, but they are not nothing either.
+        eprintln!("adev: {}", String::from_utf8_lossy(&outcome.stderr).trim());
+    }
+    outln!(
+        "wrote {} ({bytes} bytes) from {container} in {:.2}s",
+        out.display(),
+        started.elapsed().as_secs_f64()
+    );
+    ExitCode::SUCCESS
+}
+
+/// Removes a dump that did not finish and says why, so the failure cannot be
+/// mistaken later for a backup that exists.
+fn abandon(out: &Path, reason: &str) -> ExitCode {
+    let _ = std::fs::remove_file(out);
+    eprintln!("adev: dump failed, {} removed: {reason}", out.display());
+    ExitCode::from(2)
 }
