@@ -2,7 +2,7 @@
 
 use aether_dev::cli::{Cli, Command, DbCommand, DomainCommand};
 use aether_dev::config::Config;
-use aether_dev::db::{dump_plan, Engine};
+use aether_dev::db::{dump_plan, restore_plan, Engine};
 use aether_dev::docker::{probe_all, DockerClient, DockerError, HttpDockerClient};
 use aether_dev::domain::{Project, ServiceStatus};
 use aether_dev::git::GitCli;
@@ -12,11 +12,12 @@ use aether_dev::proxy::DomainSet;
 use aether_dev::scan::FsProjectScanner;
 use aether_dev::tui::{Dashboard, Tab, Update};
 use clap::Parser;
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use serde::Serialize;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Sender};
@@ -55,16 +56,6 @@ fn main() -> ExitCode {
         Command::Domains(command) => domains(&config, command),
         Command::Tui => tui(&config),
     }
-}
-
-/// Commands whose surface is settled but whose implementation has not landed.
-/// They refuse loudly with their own exit code, so a script can tell "not
-/// built" apart from "ran and found nothing".
-fn not_built_yet(name: &str) -> ExitCode {
-    eprintln!(
-        "adev: `{name}` has no implementation in this build; `scan` is the only command that runs"
-    );
-    ExitCode::from(3)
 }
 
 #[derive(Serialize)]
@@ -484,7 +475,11 @@ fn db(config: &Config, command: DbCommand) -> ExitCode {
             gzip,
             force,
         } => export(config, &service, &database, &out, gzip, force),
-        DbCommand::Import { .. } => not_built_yet("db import"),
+        DbCommand::Import {
+            service,
+            database,
+            file,
+        } => import(config, &service, &database, &file),
     }
 }
 
@@ -596,4 +591,146 @@ fn abandon(out: &Path, reason: &str) -> ExitCode {
     let _ = std::fs::remove_file(out);
     eprintln!("adev: dump failed, {} removed: {reason}", out.display());
     ExitCode::from(2)
+}
+
+/// Reads a dump from disk, decompressing it when it is gzipped.
+///
+/// The whole file is held in memory because the archive handed to the daemon
+/// has to be one body. That is fine for the dumps a local development stack
+/// produces and would not be for a production sized one.
+fn read_dump(path: &Path) -> Result<Vec<u8>, ExitCode> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        eprintln!("adev: cannot read {}: {error}", path.display());
+        ExitCode::from(2)
+    })?;
+
+    // Detected from the content rather than the file name, because a dump does
+    // not stop being gzipped when somebody renames it.
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut plain = Vec::new();
+        return GzDecoder::new(&bytes[..])
+            .read_to_end(&mut plain)
+            .map(|_| plain)
+            .map_err(|error| {
+                eprintln!(
+                    "adev: {} is gzipped but unreadable: {error}",
+                    path.display()
+                );
+                ExitCode::from(2)
+            });
+    }
+    Ok(bytes)
+}
+
+/// Wraps the dump in a tar, which is the only shape the daemon accepts for
+/// putting a file into a container.
+fn tar_of(name: &str, content: &[u8]) -> Result<Vec<u8>, ExitCode> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(content.len() as u64);
+    header.set_mode(0o600);
+    header.set_cksum();
+
+    builder
+        .append_data(&mut header, name, content)
+        .and_then(|()| builder.into_inner())
+        .map_err(|error| {
+            eprintln!("adev: could not package the dump: {error}");
+            ExitCode::from(2)
+        })
+}
+
+fn import(config: &Config, service: &str, database: &str, file: &Path) -> ExitCode {
+    let dump = match read_dump(file) {
+        Ok(dump) => dump,
+        Err(code) => return code,
+    };
+
+    let client = match docker_client(config) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let container = match container_for(&client, service) {
+        Ok(container) => container,
+        Err(code) => return code,
+    };
+    let detail = match client.inspect(&container) {
+        Ok(detail) => detail,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(engine) = Engine::from_image(&detail.image) else {
+        eprintln!(
+            "adev: {container} runs {}, which is not a database this build knows how to load",
+            detail.image
+        );
+        return ExitCode::from(2);
+    };
+
+    // A name of its own per run, so two imports at once cannot read each
+    // other's file and a leftover from a crash is recognisable.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or_default();
+    let name = format!("adev-import-{stamp}");
+    let remote = format!("/tmp/{name}");
+
+    let plan = match restore_plan(engine, database, &remote, &detail.env) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let archive = match tar_of(&name, &dump) {
+        Ok(archive) => archive,
+        Err(code) => return code,
+    };
+
+    let started = Instant::now();
+    if let Err(error) = client.upload(&container, "/tmp", &archive) {
+        eprintln!("adev: could not put the dump into {container}: {error}");
+        return ExitCode::from(2);
+    }
+
+    let mut discard = Vec::new();
+    let outcome = client.exec(&container, &plan.command, &plan.env, &mut discard);
+    // The copy inside the container goes whatever happened, so a dump does not
+    // sit in /tmp of a running database until somebody notices.
+    let _ = client.exec(
+        &container,
+        &["rm".to_string(), "-f".to_string(), remote.clone()],
+        &[],
+        &mut Vec::new(),
+    );
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    if outcome.exit_code != 0 {
+        eprintln!(
+            "adev: import failed, exit {}: {}",
+            outcome.exit_code,
+            String::from_utf8_lossy(&outcome.stderr).trim()
+        );
+        return ExitCode::from(2);
+    }
+    if !outcome.stderr.is_empty() {
+        eprintln!("adev: {}", String::from_utf8_lossy(&outcome.stderr).trim());
+    }
+
+    outln!(
+        "loaded {} ({} bytes) into {database} on {container} in {:.2}s",
+        file.display(),
+        dump.len(),
+        started.elapsed().as_secs_f64()
+    );
+    ExitCode::SUCCESS
 }
