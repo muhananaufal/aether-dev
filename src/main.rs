@@ -3,7 +3,9 @@
 use aether_dev::catalog;
 use aether_dev::cli::{Cli, Command, DbCommand, DomainCommand};
 use aether_dev::config::{self, Config};
-use aether_dev::db::{backup_filename, dump_all_plan, dump_plan, restore_plan, Engine, ExecPlan};
+use aether_dev::db::{
+    backup_filename, dump_all_plan, dump_plan, restore_plan, Account, Engine, ExecPlan,
+};
 use aether_dev::docker::{probe_all, DockerClient, DockerError, HttpDockerClient};
 use aether_dev::domain::{Project, ServiceState, ServiceStatus};
 use aether_dev::dotenv;
@@ -675,6 +677,26 @@ fn domains(config: &Config, command: DomainCommand) -> ExitCode {
     }
 }
 
+/// The database account configured for a service, or an empty one that leaves
+/// the container's own environment to answer.
+///
+/// The name is matched against both the declared service and the container it
+/// names, because either is a reasonable thing to have typed.
+fn account_for(config: &Config, service: &str) -> Account {
+    config
+        .service
+        .iter()
+        .find(|(name, settings)| {
+            name.as_str() == service || settings.container_for(name) == service
+        })
+        .map(|(_, settings)| Account {
+            user: settings.user.clone(),
+            password: settings.password.clone(),
+            password_env: settings.password_env.clone(),
+        })
+        .unwrap_or_default()
+}
+
 /// Finds the container behind a service name, accepting the container name too
 /// since that is what `docker ps` shows and what people often type.
 ///
@@ -774,7 +796,7 @@ fn export(
         );
         return ExitCode::from(2);
     };
-    let plan = match dump_plan(engine, database, &detail.env) {
+    let plan = match dump_plan(engine, database, &detail.env, &account_for(config, service)) {
         Ok(plan) => plan,
         Err(error) => {
             eprintln!("adev: {error}");
@@ -892,7 +914,13 @@ fn import(config: &Config, service: &str, database: &str, file: &Path) -> ExitCo
     let name = format!("adev-import-{stamp}");
     let remote = format!("/tmp/{name}");
 
-    let plan = match restore_plan(engine, database, &remote, &detail.env) {
+    let plan = match restore_plan(
+        engine,
+        database,
+        &remote,
+        &detail.env,
+        &account_for(config, service),
+    ) {
         Ok(plan) => plan,
         Err(error) => {
             eprintln!("adev: {error}");
@@ -1176,7 +1204,8 @@ fn backup(config: &Config, out: &Path, gzip: bool) -> ExitCode {
         let Some(engine) = Engine::from_image(&detail.image) else {
             continue;
         };
-        let plan = match dump_all_plan(engine, &detail.env) {
+        let plan = match dump_all_plan(engine, &detail.env, &account_for(config, &service.service))
+        {
             Ok(plan) => plan,
             Err(error) => {
                 eprintln!("adev: {}: {error}", service.service);
