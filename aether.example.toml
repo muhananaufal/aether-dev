@@ -118,3 +118,14 @@ domains = "domains.toml"
 #
 # A service with no container of its own needs nothing but a name:
 # [service.redis]
+
+# How this machine opens things. The defaults are the obvious ones for the
+# platform - `explorer` here, `open` on macOS, `xdg-open` elsewhere - and every
+# one of them is wrong for somebody, so both are templates you can replace.
+#
+# {} is where the URL or the folder goes. A template that never mentions it
+# gets the target appended, which is what most openers want anyway.
+#
+# [open]
+# browser = ["firefox", "--new-window", "{}"]
+# file_manager = ["code", "{}"]

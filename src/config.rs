@@ -3,6 +3,7 @@
 //! layout and could therefore never run on anyone else's.
 
 use crate::catalog::ServiceConfig;
+use crate::open::OpenConfig;
 use crate::recipe::RunOverride;
 use crate::toolchain::ToolConfig;
 use serde::Deserialize;
@@ -51,6 +52,8 @@ pub struct Config {
     /// to create it — and it is where the container name, port, hostname and
     /// database credentials stop being this tool's guesses.
     pub service: HashMap<String, ServiceConfig>,
+    /// How this machine hands a URL or a directory to the rest of the desktop.
+    pub open: OpenConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

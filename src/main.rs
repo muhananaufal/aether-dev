@@ -11,6 +11,7 @@ use aether_dev::domain::{Project, ServiceState, ServiceStatus};
 use aether_dev::dotenv;
 use aether_dev::git::GitCli;
 use aether_dev::listen;
+use aether_dev::open;
 use aether_dev::ports::ScanEvent;
 use aether_dev::ports::{collect, ProjectScanner};
 use aether_dev::proxy::DomainSet;
@@ -387,6 +388,15 @@ fn kill(port: u16, dry_run: bool) -> ExitCode {
 /// waits: results reach the dashboard as messages, which is the arrangement
 /// that keeps the screen answering while work is still running.
 fn spawn_collectors(config: &Config, updates: Sender<Update>) {
+    spawn_project_collector(config, updates.clone());
+    spawn_service_collector(config, updates);
+}
+
+/// Rescans the project roots. Separate from the services because a rescan of a
+/// few dozen repositories is the slowest thing the dashboard does, and asking
+/// for it every time somebody wants to see whether a container came back up
+/// would make the quick answer wait on the slow one.
+fn spawn_project_collector(config: &Config, updates: Sender<Update>) {
     let project_config = config.project.clone();
     let workers = config.scan.workers;
     let git_timeout = config.scan.git_timeout_ms;
@@ -406,7 +416,11 @@ fn spawn_collectors(config: &Config, updates: Sender<Update>) {
             }
         }
     });
+}
 
+/// Asks docker what it has, and merges it with what the configuration says
+/// this machine is meant to have.
+fn spawn_service_collector(config: &Config, updates: Sender<Update>) {
     let endpoint = config.docker.endpoint.clone();
     let docker_host = std::env::var("DOCKER_HOST").ok();
     let declared = config.services_declared();
@@ -506,8 +520,23 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                 KeyCode::PageUp => dashboard.move_selection(-10),
                 // The new collectors report into the same channel the loop is
                 // already draining, so their results land like any other.
-                KeyCode::Char('r') => {
+                // Refresh what you are looking at. Rescanning every repository
+                // to find out whether a container restarted is a wait nobody
+                // asked for, so the focused pane decides what is redone.
+                KeyCode::Char('r') => match dashboard.focus() {
+                    Pane::Projects => {
+                        dashboard.begin_refresh();
+                        dashboard.apply(Update::Notice(Notice::working("rescanning projects")));
+                        spawn_project_collector(config, updates.clone());
+                    }
+                    Pane::Services | Pane::Ports => {
+                        dashboard.apply(Update::Notice(Notice::working("rereading services")));
+                        spawn_service_collector(config, updates.clone());
+                    }
+                },
+                KeyCode::Char('R') => {
                     dashboard.begin_refresh();
+                    dashboard.apply(Update::Notice(Notice::working("refreshing everything")));
                     spawn_collectors(config, updates.clone());
                 }
 
@@ -533,16 +562,37 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                 }
 
                 KeyCode::Char('o') => {
-                    let url = dashboard
-                        .selected_service()
-                        .and_then(|service| service.port)
-                        .map(|port| format!("http://localhost:{port}"));
+                    // A service can name the page worth opening. A port with no
+                    // page behind it is still better than nothing, so it stays
+                    // as the fallback.
+                    let url = dashboard.selected_service().and_then(|service| {
+                        panel_for(config, &service.service)
+                            .or_else(|| service.port.map(|port| format!("http://localhost:{port}")))
+                    });
                     let notice = match url {
-                        Some(url) => match open_in_browser(&url) {
+                        Some(url) => match spawn_opener(&config.open.browser, &url) {
                             Ok(()) => Notice::done(format!("opened {url}")),
                             Err(error) => Notice::failed(format!("{url}: {error}")),
                         },
-                        None => Notice::failed("nothing here publishes a port to open"),
+                        None => Notice::failed("nothing here publishes a port or a page to open"),
+                    };
+                    dashboard.apply(Update::Notice(notice));
+                }
+
+                // The project's directory, in whatever this machine uses to
+                // look at directories.
+                KeyCode::Char('e') => {
+                    let notice = match dashboard.selected_project() {
+                        Some(project) => {
+                            let path = project.path.display().to_string();
+                            match spawn_opener(&config.open.file_manager, &path) {
+                                Ok(()) => Notice::done(format!("opened {path}")),
+                                Err(error) => Notice::failed(format!("{path}: {error}")),
+                            }
+                        }
+                        None => Notice::failed(
+                            "e opens a project's folder — move to the projects pane first",
+                        ),
                     };
                     dashboard.apply(Update::Notice(notice));
                 }
@@ -1647,29 +1697,31 @@ fn spawn_service_action(
 }
 
 /// Hands a URL to whatever the system opens links with.
-fn open_in_browser(url: &str) -> std::io::Result<()> {
-    #[cfg(windows)]
-    let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        // The empty argument is the window title start expects; without it the
-        // URL is taken as the title and nothing opens.
-        command.args(["/C", "start", "", url]);
-        command
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = std::process::Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut command = std::process::Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
+/// Hands `target` to whichever command the configuration says opens that kind
+/// of thing.
+fn spawn_opener(template: &[String], target: &str) -> std::io::Result<()> {
+    let line = open::command_line(template, target).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nothing is configured to open this",
+        )
+    })?;
+    let (program, arguments) = line.split_first().expect("command_line never yields none");
+    std::process::Command::new(program)
+        .args(arguments)
+        .spawn()
+        .map(|_| ())
+}
 
-    command.spawn().map(|_| ())
+/// The page a service says is worth opening, if it named one.
+fn panel_for(config: &Config, service: &str) -> Option<String> {
+    config
+        .service
+        .iter()
+        .find(|(name, settings)| {
+            name.as_str() == service || settings.container_for(name) == service
+        })
+        .and_then(|(_, settings)| settings.panel.clone())
 }
 
 /// Opens a service or a project in a browser.
@@ -1683,7 +1735,7 @@ fn open(config: &Config, target: &str) -> ExitCode {
             .find(|s| s.service == target || s.container == target)
         {
             return match service.port {
-                Some(port) => open_url(&format!("http://localhost:{port}")),
+                Some(port) => open_url(config, &format!("http://localhost:{port}")),
                 None => {
                     eprintln!("adev: {target} publishes no port to open");
                     ExitCode::from(2)
@@ -1700,7 +1752,7 @@ fn open(config: &Config, target: &str) -> ExitCode {
     let present: Vec<&str> = entries.iter().map(String::as_str).collect();
     match recipe::plan_for(&name, &present, &config.recipe, &config.run).and_then(|plan| plan.port)
     {
-        Some(port) => open_url(&format!("http://localhost:{port}")),
+        Some(port) => open_url(config, &format!("http://localhost:{port}")),
         None => {
             eprintln!("adev: nothing here says which address {name} would serve on");
             ExitCode::from(2)
@@ -1708,8 +1760,8 @@ fn open(config: &Config, target: &str) -> ExitCode {
     }
 }
 
-fn open_url(url: &str) -> ExitCode {
-    match open_in_browser(url) {
+fn open_url(config: &Config, url: &str) -> ExitCode {
+    match spawn_opener(&config.open.browser, url) {
         Ok(()) => {
             outln!("opened {url}");
             ExitCode::SUCCESS
