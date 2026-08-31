@@ -403,7 +403,25 @@ fn kill(port: u16, dry_run: bool) -> ExitCode {
 /// that keeps the screen answering while work is still running.
 fn spawn_collectors(config: &Config, updates: Sender<Update>) {
     spawn_project_collector(config, updates.clone());
-    spawn_service_collector(config, updates);
+    spawn_service_collector(config, updates.clone());
+    spawn_port_collector(updates);
+}
+
+/// Asks the machine what is listening, which is a different question from what
+/// docker publishes.
+///
+/// Measured here at around 600 ms against 130 ms for the services, because it
+/// runs netstat and then tasklist. Both are single calls whatever the port
+/// count, so the cost is flat - and it happens on a thread, where a slow answer
+/// holds up nothing but itself.
+fn spawn_port_collector(updates: Sender<Update>) {
+    std::thread::spawn(move || {
+        let update = match listen::listening() {
+            Ok(listeners) => Update::Ports(listeners),
+            Err(error) => Update::PortsFailed(error.to_string()),
+        };
+        let _ = updates.send(update);
+    });
 }
 
 /// Rescans the project roots. Separate from the services because a rescan of a
@@ -604,9 +622,16 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                         dashboard.apply(Update::Notice(Notice::working("rescanning projects")));
                         spawn_project_collector(config, updates.clone());
                     }
-                    Pane::Services | Pane::Ports => {
+                    Pane::Services => {
                         dashboard.apply(Update::Notice(Notice::working("rereading services")));
                         spawn_service_collector(config, updates.clone());
+                    }
+                    // Both, because the pane names the container behind each
+                    // port and that name comes from the services.
+                    Pane::Ports => {
+                        dashboard.apply(Update::Notice(Notice::working("rereading ports")));
+                        spawn_service_collector(config, updates.clone());
+                        spawn_port_collector(updates.clone());
                     }
                 },
                 KeyCode::Char('R') => {
@@ -637,19 +662,32 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                 }
 
                 KeyCode::Char('o') => {
-                    // A service can name the page worth opening. A port with no
-                    // page behind it is still better than nothing, so it stays
-                    // as the fallback.
-                    let url = dashboard.selected_service().and_then(|service| {
-                        panel_for(config, &service.service)
-                            .or_else(|| service.port.map(|port| format!("http://localhost:{port}")))
-                    });
+                    // Whatever the focused row is: a service's declared page or
+                    // its port, a project's address, or just the port a stray
+                    // listener holds. Every pane has something worth opening.
+                    let url = match dashboard.focus() {
+                        Pane::Projects => dashboard
+                            .selected_project()
+                            .and_then(|project| project_url(config, &project.name, &project.path)),
+                        _ => dashboard
+                            .selected_service()
+                            .and_then(|service| {
+                                panel_for(config, &service.service).or_else(|| {
+                                    service.port.map(|port| format!("http://localhost:{port}"))
+                                })
+                            })
+                            .or_else(|| {
+                                dashboard
+                                    .selected_port()
+                                    .map(|l| format!("http://localhost:{}", l.port))
+                            }),
+                    };
                     let notice = match url {
                         Some(url) => match spawn_opener(&config.open.browser, &url) {
                             Ok(()) => Notice::done(format!("opened {url}")),
                             Err(error) => Notice::failed(format!("{url}: {error}")),
                         },
-                        None => Notice::failed("nothing here publishes a port or a page to open"),
+                        None => Notice::failed("nothing here says which address to open"),
                     };
                     dashboard.apply(Update::Notice(notice));
                 }
@@ -1926,16 +1964,25 @@ fn open(config: &Config, target: &str) -> ExitCode {
         Ok(found) => found,
         Err(code) => return code,
     };
-    let entries = entries_in(&path);
-    let present: Vec<&str> = entries.iter().map(String::as_str).collect();
-    match recipe::plan_for(&name, &present, &config.recipe, &config.run).and_then(|plan| plan.port)
-    {
-        Some(port) => open_url(config, &format!("http://localhost:{port}")),
+    match project_url(config, &name, &path) {
+        Some(url) => open_url(config, &url),
         None => {
             eprintln!("adev: nothing here says which address {name} would serve on");
             ExitCode::from(2)
         }
     }
+}
+
+/// The address a project would serve on, worked out from its recipe.
+///
+/// Shared by `adev open` and the dashboard's `o`, so a project that opens from
+/// one opens from the other.
+fn project_url(config: &Config, name: &str, path: &Path) -> Option<String> {
+    let entries = entries_in(path);
+    let present: Vec<&str> = entries.iter().map(String::as_str).collect();
+    recipe::plan_for(name, &present, &config.recipe, &config.run)
+        .and_then(|plan| plan.port)
+        .map(|port| format!("http://localhost:{port}"))
 }
 
 fn open_url(config: &Config, url: &str) -> ExitCode {

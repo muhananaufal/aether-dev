@@ -11,6 +11,7 @@
 //! drawing never waits on one — the rule the predecessor broke.
 
 use crate::domain::{GitStatus, Project, ServiceState, ServiceStatus};
+use crate::listen::Listener;
 use crate::memory;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
@@ -98,6 +99,11 @@ pub enum Update {
         scanned: usize,
     },
     Services(Vec<ServiceStatus>),
+    /// Everything listening on this machine, docker or not. A separate fact
+    /// from what docker publishes: the port you are looking for is usually
+    /// held by a stray dev server, not a container.
+    Ports(Vec<Listener>),
+    PortsFailed(String),
     /// What the container host is costing, re-read on a timer.
     Memory(memory::Reading),
     ServicesFailed(String),
@@ -228,6 +234,8 @@ pub struct Dashboard {
     /// What the container host is costing this machine. Polled on its own
     /// timer, so a slow probe cannot hold up the rest of the screen.
     memory: memory::Reading,
+    ports: Vec<Listener>,
+    ports_error: Option<String>,
 }
 
 impl Default for Dashboard {
@@ -253,6 +261,8 @@ impl Dashboard {
             settings: Vec::new(),
             showing_settings: false,
             memory: memory::Reading::default(),
+            ports: Vec::new(),
+            ports_error: None,
         }
     }
 
@@ -269,6 +279,12 @@ impl Dashboard {
                 self.clamp(Pane::Ports);
             }
             Update::ServicesFailed(reason) => self.services_error = Some(reason),
+            Update::Ports(ports) => {
+                self.ports = ports;
+                self.ports_error = None;
+                self.clamp(Pane::Ports);
+            }
+            Update::PortsFailed(reason) => self.ports_error = Some(reason),
             Update::Notice(notice) => self.notice = Some(notice),
             Update::LogLine { container, line } => {
                 // Only for the log actually open. A stream still winding down
@@ -336,14 +352,28 @@ impl Dashboard {
             .flatten()
     }
 
-    /// The service the cursor is on, in whichever of the two service panes has
-    /// the focus. The ports pane lists a subset, so the row number there means
-    /// something different.
+    /// The service the cursor is on.
+    ///
+    /// In the ports pane most rows have no container behind them - that is the
+    /// point of listing every listener - so the answer there is whichever
+    /// service published that port, and nothing when none did.
     pub fn selected_service(&self) -> Option<&ServiceStatus> {
         match self.focus {
             Pane::Services => self.services.get(self.selected[Pane::Services.index()]),
-            Pane::Ports => self.published().nth(self.selected[Pane::Ports.index()]),
+            Pane::Ports => {
+                let port = self.selected_port()?.port;
+                self.services.iter().find(|s| s.port == Some(port))
+            }
             Pane::Projects => None,
+        }
+    }
+
+    /// The listener the cursor is on, which exists whether or not docker knows
+    /// anything about it.
+    pub fn selected_port(&self) -> Option<&Listener> {
+        match self.focus {
+            Pane::Ports => self.ports.get(self.selected[Pane::Ports.index()]),
+            _ => None,
         }
     }
 
@@ -404,12 +434,8 @@ impl Dashboard {
         match pane {
             Pane::Projects => self.projects.len(),
             Pane::Services => self.services.len(),
-            Pane::Ports => self.published().count(),
+            Pane::Ports => self.ports.len(),
         }
-    }
-
-    fn published(&self) -> impl Iterator<Item = &ServiceStatus> {
-        self.services.iter().filter(|s| s.port.is_some())
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -488,7 +514,7 @@ impl Dashboard {
                 self.service_rows(),
             ),
             Pane::Ports => (
-                vec!["PORT", "SERVICE", ""],
+                vec!["PORT", "PROCESS", "SERVICE"],
                 vec![
                     Constraint::Length(7),
                     Constraint::Fill(1),
@@ -578,15 +604,20 @@ impl Dashboard {
             // running, which is a different thing from a daemon nobody could
             // reach. Neither pane pretends to a number it does not have.
             Pane::Services if self.services_error.is_some() => "unreachable".to_string(),
-            Pane::Ports if self.services_error.is_some() => "unreachable".to_string(),
+            Pane::Ports if self.ports_error.is_some() => "unreadable".to_string(),
             Pane::Services => {
                 let ready = self.services.iter().filter(|s| s.is_reachable()).count();
                 format!("{ready} of {} ready", self.services.len())
             }
             Pane::Ports => {
-                let published: Vec<&ServiceStatus> = self.published().collect();
-                let answering = published.iter().filter(|s| s.port_open).count();
-                format!("{answering} of {} answering", published.len())
+                // How many are containers is the useful split here: the rest
+                // are the ones nothing is managing for you.
+                let docker = self
+                    .ports
+                    .iter()
+                    .filter(|listener| self.services.iter().any(|s| s.port == Some(listener.port)))
+                    .count();
+                format!("{} listening · {docker} docker", self.ports.len())
             }
         }
     }
@@ -629,17 +660,22 @@ impl Dashboard {
     }
 
     fn port_rows(&self) -> Vec<Row<'static>> {
-        self.published()
-            .map(|service| {
-                let (answer, style) = if service.port_open {
-                    ("answering", Style::default().fg(paint::GOOD))
-                } else {
-                    ("no answer", Style::default().fg(paint::BAD))
-                };
+        self.ports
+            .iter()
+            .map(|listener| {
+                // Naming the container when there is one is most of the value:
+                // it turns "something holds 3306" into "that is mysql".
+                let service = self
+                    .services
+                    .iter()
+                    .find(|s| s.port == Some(listener.port))
+                    .map(|s| s.service.clone())
+                    .unwrap_or_default();
                 Row::new(vec![
-                    Cell::from(service.port.unwrap_or_default().to_string()),
-                    Cell::from(service.service.clone()),
-                    Cell::from(answer).style(style),
+                    Cell::from(listener.port.to_string()),
+                    Cell::from(listener.process.clone().unwrap_or_else(|| "-".to_string()))
+                        .style(Style::default().fg(paint::MUTED)),
+                    Cell::from(service).style(Style::default().fg(paint::GOOD)),
                 ])
             })
             .collect()
@@ -733,7 +769,7 @@ const KEYS: &[(&str, &str)] = &[
     ("s", "start the selected service"),
     ("x", "stop it"),
     ("S", "restart it"),
-    ("o", "open its page, or its port, in a browser"),
+    ("o", "open whatever the focused row serves"),
     ("enter", "run the selected project"),
     ("l", "read the selected service's log"),
     ("t", "open a shell in a project, on its own toolchain"),
@@ -1155,14 +1191,95 @@ mod tests {
         );
     }
 
+    fn listener(port: u16, process: &str, pid: u32) -> Listener {
+        Listener {
+            port,
+            pid: Some(pid),
+            process: Some(process.to_string()),
+        }
+    }
+
     #[test]
-    fn ports_lists_only_the_services_that_publish_one() {
+    fn the_ports_pane_lists_every_listener_not_only_the_docker_ones() {
         let mut dashboard = Dashboard::new();
-        let mut quiet = service("internal", 0, false);
-        quiet.port = None;
-        dashboard.apply(Update::Services(vec![service("mysql", 3306, true), quiet]));
-        assert_eq!(dashboard.rows_in(Pane::Services), 2);
-        assert_eq!(dashboard.rows_in(Pane::Ports), 1);
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        dashboard.apply(Update::Ports(vec![
+            listener(3306, "wslrelay.exe", 17336),
+            listener(5173, "node.exe", 900),
+            listener(22, "sshd.exe", 4764),
+        ]));
+
+        assert_eq!(
+            dashboard.rows_in(Pane::Ports),
+            3,
+            "the pane is called Ports; a stray dev server is the usual reason to look at it"
+        );
+    }
+
+    #[test]
+    fn a_port_that_belongs_to_a_container_still_reaches_that_service() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        dashboard.apply(Update::Ports(vec![
+            listener(22, "sshd.exe", 4764),
+            listener(3306, "wslrelay.exe", 17336),
+        ]));
+        dashboard.focus_on(Pane::Ports);
+        dashboard.move_selection(1);
+
+        assert_eq!(
+            dashboard.selected_service().map(|s| s.service.as_str()),
+            Some("mysql"),
+            "start, stop and logs must keep working from this pane"
+        );
+    }
+
+    #[test]
+    fn a_port_no_container_owns_resolves_to_no_service() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        dashboard.apply(Update::Ports(vec![listener(5173, "node.exe", 900)]));
+        dashboard.focus_on(Pane::Ports);
+
+        assert!(
+            dashboard.selected_service().is_none(),
+            "a stray dev server has no container to stop"
+        );
+        assert_eq!(dashboard.selected_port().map(|l| l.port), Some(5173));
+    }
+
+    #[test]
+    fn a_stray_dev_server_is_on_screen_with_the_process_holding_it() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        dashboard.apply(Update::Ports(vec![
+            listener(3306, "wslrelay.exe", 17336),
+            listener(5173, "node.exe", 900),
+        ]));
+
+        let view = screen(&drawn(&mut dashboard, 140, 24));
+        assert!(view.contains("5173"), "the stray port itself");
+        assert!(view.contains("node.exe"), "what is holding it");
+        assert!(
+            view.contains("mysql"),
+            "and the container name where there is one"
+        );
+        assert!(
+            view.contains("2 listening"),
+            "the count belongs on the frame; got {view}"
+        );
+    }
+
+    #[test]
+    fn the_ports_pane_is_empty_until_its_own_collector_reports() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        assert_eq!(
+            dashboard.rows_in(Pane::Ports),
+            0,
+            "docker publishing a port is not the same fact as something listening on it"
+        );
     }
 
     #[test]
@@ -1286,8 +1403,8 @@ mod tests {
         );
         assert!(view.contains("2 of 3 ready"), "services ready out of total");
         assert!(
-            view.contains("2 of 3 answering"),
-            "ports answering out of published"
+            view.contains("0 listening"),
+            "the ports pane counts listeners, and none have been reported here"
         );
     }
 
@@ -1383,18 +1500,19 @@ mod tests {
     }
 
     #[test]
-    fn the_ports_pane_selects_by_its_own_shorter_list() {
+    fn the_ports_pane_selects_by_its_own_list_not_the_services_one() {
         let mut dashboard = Dashboard::new();
         let mut quiet = service("internal", 0, false);
         quiet.port = None;
         // The unpublished one sits first, so a shared row number would pick it.
         dashboard.apply(Update::Services(vec![quiet, service("mysql", 3306, true)]));
+        dashboard.apply(Update::Ports(vec![listener(3306, "wslrelay.exe", 17336)]));
 
         dashboard.focus_on(Pane::Ports);
         assert_eq!(
             dashboard.selected_service().map(|s| s.service.as_str()),
             Some("mysql"),
-            "row 0 of ports is the first published service, not the first service"
+            "row 0 of ports is a listener, resolved to whichever service published it"
         );
     }
 
