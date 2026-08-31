@@ -245,6 +245,78 @@ pub fn discover(start: &Path, machine_wide: Option<&Path>) -> Option<PathBuf> {
         .filter(|path| path.is_file())
         .map(Path::to_path_buf)
 }
+
+/// Writes a configuration describing this machine, for somebody who has not
+/// got one yet.
+///
+/// Only what is actually there goes in. A generated file that names a
+/// directory nobody has is worse than an empty one: it reads as a fact about
+/// the machine and sends the reader looking for a bug that is not there.
+///
+/// It is a starting point rather than a settings screen. The file has comments
+/// explaining the choices, and rewriting it from a form would throw those away
+/// every time somebody changed a number.
+pub fn starter(
+    roots: &[PathBuf],
+    toolchains: &[(String, PathBuf, String)],
+    docker_host: Option<&str>,
+) -> String {
+    let mut out = String::from(
+        "# Written by `adev config --init` from what was found on this machine.\n\
+         # Everything here has a default; delete anything you do not want to pin.\n",
+    );
+
+    let present: Vec<&PathBuf> = roots.iter().filter(|root| root.is_dir()).collect();
+    if !present.is_empty() {
+        out.push_str("\n[project]\nroots = [");
+        let quoted: Vec<String> = present
+            .iter()
+            .map(|root| {
+                format!(
+                    "\"{}\"",
+                    root.display()
+                        .to_string()
+                        .replace(std::path::MAIN_SEPARATOR, "/")
+                )
+            })
+            .collect();
+        out.push_str(&quoted.join(", "));
+        out.push_str("]\n");
+    }
+
+    if let Some(endpoint) = docker_host {
+        out.push_str(&format!(
+            "\n[docker]\n# Taken from DOCKER_HOST as it was set when this ran.\nendpoint = \"{endpoint}\"\n"
+        ));
+    }
+
+    for (tool, directory, binary) in toolchains {
+        if !holds_a_version(directory, binary) {
+            continue;
+        }
+        out.push_str(&format!(
+            "\n[toolchain.{tool}]\nsearch = [\"{}\"]\nbinary = \"{binary}\"\n",
+            directory
+                .display()
+                .to_string()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        ));
+    }
+
+    out
+}
+
+/// Whether a directory actually holds at least one installation, rather than
+/// merely existing.
+fn holds_a_version(directory: &Path, binary: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.is_dir() && (path.join(binary).is_file() || path.join("bin").join(binary).is_file())
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +595,68 @@ container = \"\"
     fn an_entry_that_changes_nothing_is_refused_rather_than_ignored() {
         let err = Config::from_toml_str("[run.shop]\n").unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_starter_config_only_offers_toolchains_that_are_actually_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let php = dir.path().join("php").join("php-8.3");
+        std::fs::create_dir_all(&php).unwrap();
+        std::fs::write(php.join("php.exe"), "").unwrap();
+
+        let written = starter(
+            &[dir.path().join("nowhere-at-all")],
+            &[(
+                "php".to_string(),
+                dir.path().join("php"),
+                "php.exe".to_string(),
+            )],
+            Some("tcp://localhost:2375"),
+        );
+
+        assert!(written.contains("[toolchain.php]"));
+        assert!(written.contains("php.exe"));
+        assert!(
+            !written.contains("nowhere-at-all"),
+            "a root that is not there would be written as a fact about this machine"
+        );
+        assert!(written.contains("tcp://localhost:2375"));
+    }
+
+    #[test]
+    fn a_toolchain_directory_with_no_versions_in_it_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("php")).unwrap();
+        let written = starter(
+            &[],
+            &[(
+                "php".to_string(),
+                dir.path().join("php"),
+                "php.exe".to_string(),
+            )],
+            None,
+        );
+        assert!(
+            !written.contains("[toolchain.php]"),
+            "an empty directory is not an installation, and saying so would send \
+             somebody looking for a bug that is not there"
+        );
+    }
+
+    #[test]
+    fn a_starter_config_is_valid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        let written = starter(&[dir.path().join("projects")], &[], None);
+        Config::from_toml_str(&written).expect("what init writes must load");
+    }
+
+    #[test]
+    fn a_starter_config_says_where_it_came_from() {
+        let written = starter(&[], &[], None);
+        assert!(
+            written.starts_with('#'),
+            "a generated file should say it was generated on line one"
+        );
     }
 }
