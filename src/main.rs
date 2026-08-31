@@ -555,59 +555,21 @@ fn export(
         }
     };
 
-    let file = match std::fs::File::create(out) {
-        Ok(file) => file,
-        Err(error) => {
-            eprintln!("adev: cannot write {}: {error}", out.display());
-            return ExitCode::from(2);
-        }
-    };
-    let mut sink = BufWriter::new(file);
-
     let started = Instant::now();
-    let outcome = if gzip {
-        let mut encoder = GzEncoder::new(&mut sink, Compression::default());
-        let outcome = client.exec(&container, &plan.command, &plan.env, &mut encoder);
-        outcome.and_then(|outcome| {
-            encoder
-                .finish()
-                .map(|_| outcome)
-                .map_err(|error| DockerError::Malformed(error.to_string()))
-        })
-    } else {
-        client.exec(&container, &plan.command, &plan.env, &mut sink)
-    };
-
-    let outcome = match outcome.and_then(|outcome| {
-        sink.flush()
-            .map(|()| outcome)
-            .map_err(|error| DockerError::Malformed(error.to_string()))
-    }) {
-        Ok(outcome) => outcome,
-        Err(error) => return abandon(out, &format!("{error}")),
-    };
-
-    if outcome.exit_code != 0 {
-        // A half written dump that looks like a backup is worse than no dump,
-        // so the file goes rather than being left for someone to trust later.
-        let reason = String::from_utf8_lossy(&outcome.stderr).trim().to_string();
-        return abandon(
-            out,
-            &format!("{} exited {}: {reason}", plan.command[0], outcome.exit_code),
-        );
+    match dump_to_file(&client, &container, &plan, out, gzip) {
+        Ok((bytes, warnings)) => {
+            if !warnings.is_empty() {
+                eprintln!("adev: {}", String::from_utf8_lossy(&warnings).trim());
+            }
+            outln!(
+                "wrote {} ({bytes} bytes) from {container} in {:.2}s",
+                out.display(),
+                started.elapsed().as_secs_f64()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(reason) => abandon(out, &reason),
     }
-
-    let bytes = std::fs::metadata(out).map(|meta| meta.len()).unwrap_or(0);
-    if !outcome.stderr.is_empty() {
-        // Warnings are not failures, but they are not nothing either.
-        eprintln!("adev: {}", String::from_utf8_lossy(&outcome.stderr).trim());
-    }
-    outln!(
-        "wrote {} ({bytes} bytes) from {container} in {:.2}s",
-        out.display(),
-        started.elapsed().as_secs_f64()
-    );
-    ExitCode::SUCCESS
 }
 
 /// Removes a dump that did not finish and says why, so the failure cannot be
@@ -976,7 +938,14 @@ fn backup(config: &Config, out: &Path, gzip: bool) -> ExitCode {
 
         let path = directory.join(backup_filename(&service.service, engine, gzip));
         match dump_to_file(&client, &service.container, &plan, &path, gzip) {
-            Ok(bytes) => {
+            Ok((bytes, warnings)) => {
+                if !warnings.is_empty() {
+                    eprintln!(
+                        "adev: {}: {}",
+                        service.service,
+                        String::from_utf8_lossy(&warnings).trim()
+                    );
+                }
                 outln!("{} -> {} ({bytes} bytes)", service.service, path.display());
                 written += 1;
             }
@@ -1011,7 +980,7 @@ fn dump_to_file(
     plan: &ExecPlan,
     path: &Path,
     gzip: bool,
-) -> Result<u64, String> {
+) -> Result<(u64, Vec<u8>), String> {
     let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
     let mut sink = BufWriter::new(file);
 
@@ -1037,7 +1006,10 @@ fn dump_to_file(
             String::from_utf8_lossy(&outcome.stderr).trim()
         ));
     }
-    std::fs::metadata(path)
+    let bytes = std::fs::metadata(path)
         .map(|meta| meta.len())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    // Warnings are not failures, but they are not nothing either, so they
+    // travel back rather than being swallowed here.
+    Ok((bytes, outcome.stderr))
 }
