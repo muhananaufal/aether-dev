@@ -1,44 +1,117 @@
 # aether-dev
 
-A terminal dashboard for a local development environment: Docker services,
-a project inventory with git status, ports, reverse-proxy domains, and
-database dump/restore.
+A terminal dashboard for a local development environment: Docker services, a
+project inventory with git status, ports, reverse-proxy domains, container
+logs, and database dump and restore.
 
-**Status: pre-alpha. Nothing runs yet.** This repository currently contains a
-license, a `.gitignore`, and this file. Code lands once the terminal rendering
-spike is confirmed on Windows.
+Every capability is a command first. The dashboard is a layer on top of the
+same functions, so anything you can do on screen you can also put in a script
+or a scheduler.
 
-## Why this exists
+**Status: early. Every command works and is used daily on the author's
+machine, but it has run on exactly one setup so far — Windows with Docker
+inside WSL. Expect the rough edges of a tool that has met one environment.**
 
-The predecessor was a single 4,300-line PowerShell script driving a WinForms
-window. It worked, and two things still made it a dead end:
+## Commands
 
-- **It froze.** Every render of the project list spawned `git status` once per
-  repository, sequentially, on the UI thread. Measured on the author's machine
-  with the exact spawn mechanism the script used: **5,983 ms for 24
-  repositories** (~249 ms each). The window was unresponsive for six seconds.
-  The same 24 repositories scanned concurrently from a Rust prototype — doing
-  *more* work, two git processes per repository instead of one — finished in
-  **850 ms**.
-- **It could not be shared.** A single-file PowerShell GUI wired to one
-  machine's paths is not something another developer can install.
+```
+adev scan       [--json]              projects, stack, branch, working-tree state
+adev services   [--json]              containers and whether they are actually usable
+adev ports      [--json]              published ports and whether they answer
+adev logs <service> [-f] [-n N]       what a service is writing
+adev db export <service> --database <db> --out <file> [--gzip] [--force]
+adev db import <service> --database <db> --file <file>
+adev domains    list
+adev domains    add <host> <container:port> [--no-reload]
+adev domains    remove <host> [--no-reload]
+adev tui                              the dashboard
+```
 
-## Design decisions
+`--config <file>` selects a configuration file; without one the defaults
+apply. Paths inside the configuration resolve against the current directory.
 
-| Decision | Reason |
-| --- | --- |
-| Rust + Ratatui 0.30.2, crossterm backend | Single binary, no runtime for users to install. Crossterm supports UNIX and Windows terminals. |
-| CLI first, TUI as a layer on top | Every capability is also a non-interactive command. The TUI calls the same functions. Scriptable, testable, usable from a scheduler. |
-| The draw loop never waits on a process | Collectors run concurrently and send results as messages; the UI draws the last known state and marks what is still loading. This is the rule the predecessor broke. |
-| Windows first, cross-platform by construction | Docker is reached through its API rather than `wsl -d Ubuntu bash -c`, project roots are configuration rather than constants, and toolchains are found on `PATH` rather than in guessed directories. |
+## Why it exists
 
-## Non-goals
+The predecessor was a 4,300-line PowerShell script driving a WinForms window.
+It worked, and two things still made it a dead end.
 
-- Replacing `lazydocker`, `ctop`, or Portainer for general container
-  management. The value here is the combination with project inventory,
-  framework and runtime-version detection, git status, and local domains.
-- Graphical rendering. If a chart is ever required, a terminal is the wrong
-  surface and this is the wrong tool.
+**It froze.** Every render of the project list spawned `git status` once per
+repository, sequentially, on the UI thread. Measured with the exact spawn
+mechanism the script used: **5,983 ms for 24 repositories**. The same
+repositories scanned concurrently here take **under a second**.
+
+**It could not be shared.** A single-file PowerShell GUI wired to one
+machine's paths is not something another developer can install.
+
+## Configuration
+
+Everything has a working default; a configuration file only overrides what it
+mentions. See `aether.example.toml`.
+
+```toml
+[project]
+roots = ["C:/Projects"]        # default: the current directory
+max_depth = 3
+ignore = ["node_modules", "vendor", "target", ".git"]
+
+[scan]
+workers = 12                   # git runs this many repositories at a time
+git_timeout_ms = 2000
+cache_ttl_secs = 30
+
+[docker]
+endpoint = "auto"              # auto follows DOCKER_HOST
+
+[caddy]
+container = "caddy-proxy"
+caddyfile = "Caddyfile"        # generated; do not edit by hand
+domains = "domains.toml"       # the source of truth for hostnames
+```
+
+An unknown key is an error rather than a typo that passes silently. A
+configuration that parses but cannot work — no project roots, zero workers —
+is refused at startup with the field named.
+
+## Reaching Docker
+
+`endpoint = "auto"` follows `DOCKER_HOST` the way other Docker clients do.
+Only TCP and HTTP endpoints work in this build; a unix socket or a Windows
+named pipe is reported as an unsupported transport rather than failing
+obscurely.
+
+On Windows with Docker inside WSL there is no socket the host can reach, so
+the daemon has to be exposed over TCP for this tool to talk to it. **Be aware
+of what that means: the Docker API is root-equivalent and unauthenticated.
+Anything that can reach the port can start a container that mounts your whole
+filesystem.** Bind it to `127.0.0.1` at most, and understand that on a
+developer machine the realistic threat is not a network attacker but a
+`postinstall` script in a package you installed.
+
+Database credentials are never stored, read from a file, or asked for: they
+are read from the container's own environment, which the daemon already
+reports.
+
+## Known limits
+
+- One environment tested: Windows 11, Docker inside WSL2, reached over TCP.
+- `db import` holds the dump in memory, because the archive handed to the
+  daemon has to be one body. Fine for a local stack, not for a large dump.
+- MySQL and Postgres keep the password out of the command line;
+  `mongodump` offers no equivalent, so for Mongo it is visible in that
+  container's process list while the dump runs.
+- The dashboard is monochrome and shows projects, services and ports. Logs
+  are a command only.
+- The Caddyfile is rewritten from the domains file. Anything added to it by
+  hand is lost on the next change.
+
+## Building
+
+```
+cargo build --release
+```
+
+The binary is `adev`. Developed against Rust 1.97 on the 2021 edition; the
+oldest version that still compiles it has not been tested.
 
 ## License
 
