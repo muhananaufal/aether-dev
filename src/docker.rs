@@ -6,8 +6,9 @@
 //! running, and only the socket work depends on the machine.
 
 use crate::domain::{ServiceState, ServiceStatus};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DockerError {
@@ -193,6 +194,201 @@ impl DockerClient for HttpDockerClient {
     }
 }
 
+/// What a container is running and with what, which is where the credentials
+/// for a dump come from. Reading them here means this tool never stores a
+/// password of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerDetail {
+    pub image: String,
+    pub env: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ApiInspect {
+    #[serde(rename = "Config")]
+    config: ApiInspectConfig,
+}
+
+#[derive(Deserialize)]
+struct ApiInspectConfig {
+    #[serde(rename = "Image", default)]
+    image: String,
+    #[serde(rename = "Env", default)]
+    env: Vec<String>,
+}
+
+pub fn parse_inspect(json: &str) -> Result<ContainerDetail, DockerError> {
+    let raw: ApiInspect =
+        serde_json::from_str(json).map_err(|error| DockerError::Malformed(error.to_string()))?;
+    Ok(ContainerDetail {
+        image: raw.config.image,
+        env: raw.config.env,
+    })
+}
+
+/// How an exec finished. A command that ran and failed is not a transport
+/// failure, so it comes back as an outcome rather than an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecOutcome {
+    pub exit_code: i64,
+    pub stderr: Vec<u8>,
+}
+
+/// Splits Docker's multiplexed exec stream back into the two streams it
+/// carries. Each frame is an eight byte header - stream number, three unused
+/// bytes, then a big-endian length - followed by that many bytes.
+///
+/// stdout is written straight through rather than collected, so a dump larger
+/// than memory still works.
+pub fn demux_into(source: &mut impl Read, stdout: &mut impl Write) -> std::io::Result<Vec<u8>> {
+    const STDERR: u8 = 2;
+    let mut stderr = Vec::new();
+    let mut header = [0u8; 8];
+
+    loop {
+        // A stream that stops between frames is the normal end. A stream that
+        // stops inside one is truncated, and either way there is nothing more
+        // to read, so both end the loop rather than raising.
+        if !read_exactly(source, &mut header)? {
+            return Ok(stderr);
+        }
+        let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        if length == 0 {
+            continue;
+        }
+
+        let mut payload = vec![0u8; length];
+        if !read_exactly(source, &mut payload)? {
+            return Ok(stderr);
+        }
+        if header[0] == STDERR {
+            stderr.extend_from_slice(&payload);
+        } else {
+            stdout.write_all(&payload)?;
+        }
+    }
+}
+
+/// Fills `buffer` completely, reporting false when the source ran out first.
+fn read_exactly(source: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<bool> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match source.read(&mut buffer[filled..]) {
+            Ok(0) => return Ok(false),
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Serialize)]
+struct ExecRequest<'a> {
+    #[serde(rename = "AttachStdout")]
+    attach_stdout: bool,
+    #[serde(rename = "AttachStderr")]
+    attach_stderr: bool,
+    #[serde(rename = "Tty")]
+    tty: bool,
+    #[serde(rename = "Cmd")]
+    cmd: &'a [String],
+    #[serde(rename = "Env")]
+    env: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct ExecCreated {
+    #[serde(rename = "Id")]
+    id: String,
+}
+
+#[derive(Serialize)]
+struct ExecStart {
+    #[serde(rename = "Detach")]
+    detach: bool,
+    #[serde(rename = "Tty")]
+    tty: bool,
+}
+
+#[derive(Deserialize)]
+struct ExecInspect {
+    #[serde(rename = "ExitCode")]
+    exit_code: Option<i64>,
+}
+
+impl HttpDockerClient {
+    fn unreachable(&self, reason: String) -> DockerError {
+        DockerError::Unreachable {
+            endpoint: self.base.clone(),
+            reason,
+        }
+    }
+
+    pub fn inspect(&self, container: &str) -> Result<ContainerDetail, DockerError> {
+        let url = format!("{}/containers/{container}/json", self.base);
+        let body = ureq::get(&url)
+            .call()
+            .map_err(|error| self.unreachable(error.to_string()))?
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| self.unreachable(error.to_string()))?;
+        parse_inspect(&body)
+    }
+
+    /// Runs a command inside a container and streams its stdout straight to
+    /// `stdout`. Nothing is buffered whole, so a dump bigger than memory is
+    /// still fine.
+    ///
+    /// A command that runs and fails is not a transport failure: the exit code
+    /// and whatever it said on stderr come back as an outcome, and the caller
+    /// decides what that means.
+    pub fn exec(
+        &self,
+        container: &str,
+        command: &[String],
+        env: &[String],
+        stdout: &mut impl Write,
+    ) -> Result<ExecOutcome, DockerError> {
+        let created: ExecCreated =
+            ureq::post(&format!("{}/containers/{container}/exec", self.base))
+                .send_json(ExecRequest {
+                    attach_stdout: true,
+                    attach_stderr: true,
+                    // Without a tty the two streams stay separate and framed, which
+                    // is what makes a dump readable rather than mixed with warnings.
+                    tty: false,
+                    cmd: command,
+                    env,
+                })
+                .map_err(|error| self.unreachable(error.to_string()))?
+                .body_mut()
+                .read_json()
+                .map_err(|error| self.unreachable(error.to_string()))?;
+
+        let mut started = ureq::post(&format!("{}/exec/{}/start", self.base, created.id))
+            .send_json(ExecStart {
+                detach: false,
+                tty: false,
+            })
+            .map_err(|error| self.unreachable(error.to_string()))?;
+
+        let stderr = demux_into(&mut started.body_mut().as_reader(), stdout)
+            .map_err(|error| self.unreachable(error.to_string()))?;
+
+        let finished: ExecInspect = ureq::get(&format!("{}/exec/{}/json", self.base, created.id))
+            .call()
+            .map_err(|error| self.unreachable(error.to_string()))?
+            .body_mut()
+            .read_json()
+            .map_err(|error| self.unreachable(error.to_string()))?;
+
+        Ok(ExecOutcome {
+            exit_code: finished.exit_code.unwrap_or(-1),
+            stderr,
+        })
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +559,69 @@ mod tests {
             "two calls to the same daemon reported different ports for one service"
         );
         assert_eq!(forward, Some(80));
+    }
+    /// Trimmed from this machine: only the fields the engine picker needs.
+    const REAL_INSPECT: &str = r#"{
+      "Id": "abc123",
+      "Config": {
+        "Image": "mysql:9.7",
+        "Env": ["MYSQL_ROOT_PASSWORD=s3cr3t", "PATH=/usr/bin"]
+      }
+    }"#;
+
+    #[test]
+    fn inspecting_a_container_reports_the_image_and_its_environment() {
+        let detail = parse_inspect(REAL_INSPECT).unwrap();
+        assert_eq!(detail.image, "mysql:9.7");
+        assert_eq!(detail.env.len(), 2);
+        assert!(detail
+            .env
+            .contains(&"MYSQL_ROOT_PASSWORD=s3cr3t".to_string()));
+    }
+
+    #[test]
+    fn a_container_with_no_environment_inspects_to_an_empty_list_not_an_error() {
+        let detail = parse_inspect(r#"{"Config":{"Image":"redis:alpine"}}"#).unwrap();
+        assert_eq!(detail.image, "redis:alpine");
+        assert!(detail.env.is_empty());
+    }
+
+    fn frame(stream: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![stream, 0, 0, 0];
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn exec_output_is_split_back_into_the_two_streams_docker_multiplexed() {
+        let mut wire = frame(1, b"CREATE TABLE");
+        wire.extend(frame(2, b"warning: skipping"));
+        wire.extend(frame(1, b" shop;"));
+
+        let mut stdout = Vec::new();
+        let stderr = demux_into(&mut std::io::Cursor::new(wire), &mut stdout).unwrap();
+        assert_eq!(stdout, b"CREATE TABLE shop;");
+        assert_eq!(stderr, b"warning: skipping");
+    }
+
+    #[test]
+    fn a_stream_cut_off_mid_frame_ends_instead_of_hanging_or_panicking() {
+        let mut wire = frame(1, b"partial");
+        wire.truncate(wire.len() - 3);
+        let mut stdout = Vec::new();
+        let stderr = demux_into(&mut std::io::Cursor::new(wire), &mut stdout).unwrap();
+        assert!(stderr.is_empty());
+        assert!(
+            stdout.len() < 7,
+            "a truncated frame must not be reported as complete output"
+        );
+    }
+
+    #[test]
+    fn an_empty_stream_produces_nothing_rather_than_failing() {
+        let mut stdout = Vec::new();
+        let stderr = demux_into(&mut std::io::Cursor::new(Vec::new()), &mut stdout).unwrap();
+        assert!(stdout.is_empty() && stderr.is_empty());
     }
 }
