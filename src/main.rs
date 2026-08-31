@@ -453,6 +453,38 @@ fn spawn_service_collector(config: &Config, updates: Sender<Update>) {
     });
 }
 
+/// Dumps one service's databases for the dashboard, off the draw loop.
+fn spawn_backup(config: &Config, service: ServiceStatus, updates: Sender<Update>) {
+    let endpoint = config.docker.endpoint.clone();
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    let directory = config.backup.directory.join(backup_directory_name());
+    let gzip = config.backup.gzip;
+    // The account lookup reads the configuration, which does not cross to the
+    // thread, so it happens here.
+    let owned = config.clone();
+
+    std::thread::spawn(move || {
+        let notice = match HttpDockerClient::new(&endpoint, docker_host.as_deref()) {
+            Err(error) => Notice::failed(error.to_string()),
+            Ok(client) => match std::fs::create_dir_all(&directory) {
+                Err(error) => {
+                    Notice::failed(format!("cannot create {}: {error}", directory.display()))
+                }
+                Ok(()) => match dump_service(&client, &owned, &service, &directory, gzip) {
+                    Ok(Dumped::Nothing(reason)) => {
+                        Notice::failed(format!("nothing dumped: {reason}"))
+                    }
+                    Ok(Dumped::Written { path, bytes, .. }) => {
+                        Notice::done(format!("{} bytes to {}", bytes, path.display()))
+                    }
+                    Err(reason) => Notice::failed(reason),
+                },
+            },
+        };
+        let _ = updates.send(Update::Notice(notice));
+    });
+}
+
 /// Re-reads what the container host costs, on its own timer.
 ///
 /// The probes shell out and can be slow, so they get a thread rather than a
@@ -621,6 +653,23 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                     };
                     dashboard.apply(Update::Notice(notice));
                 }
+
+                // Dumping every database on a service needs no arguments, so it
+                // is the one database job the dashboard can do without asking
+                // anything. It runs on a thread: a large database takes long
+                // enough that doing it here would freeze the screen.
+                KeyCode::Char('b') => match dashboard.selected_service().cloned() {
+                    Some(service) => {
+                        dashboard.apply(Update::Notice(Notice::working(format!(
+                            "backing up {}",
+                            service.service
+                        ))));
+                        spawn_backup(config, service, updates.clone());
+                    }
+                    None => dashboard.apply(Update::Notice(Notice::failed(
+                        "b backs up a service — move to the services or ports pane first",
+                    ))),
+                },
 
                 // The project's directory, in whatever this machine uses to
                 // look at directories.
@@ -1302,6 +1351,68 @@ fn backup_directory_name() -> String {
     )
 }
 
+/// What one service contributed to a backup.
+enum Dumped {
+    /// Nothing to dump, and no failure either: the container is not running,
+    /// or holds no database. The reason is carried because a backup that
+    /// quietly leaves something out is the kind of gap nobody finds until they
+    /// need the file.
+    Nothing(String),
+    Written {
+        path: PathBuf,
+        bytes: u64,
+        /// What the dump tool wrote to stderr while still succeeding.
+        warnings: Vec<u8>,
+    },
+}
+
+/// Dumps every database on one service into `directory`.
+///
+/// Shared by `adev db backup` and the dashboard, so the two cannot drift into
+/// producing different files from the same button.
+fn dump_service(
+    client: &HttpDockerClient,
+    config: &Config,
+    service: &ServiceStatus,
+    directory: &Path,
+    gzip: bool,
+) -> Result<Dumped, String> {
+    if service.state != ServiceState::Running {
+        return Ok(Dumped::Nothing(format!(
+            "{} is not running",
+            service.service
+        )));
+    }
+    let detail = client
+        .inspect(&service.container)
+        .map_err(|error| format!("{}: {error}", service.container))?;
+    let Some(engine) = Engine::from_image(&detail.image) else {
+        return Ok(Dumped::Nothing(format!(
+            "{} holds no database",
+            service.service
+        )));
+    };
+    let plan = dump_all_plan(engine, &detail.env, &account_for(config, &service.service))
+        .map_err(|error| format!("{}: {error}", service.service))?;
+
+    let path = directory.join(backup_filename(&service.service, engine, gzip));
+    match dump_to_file(client, &service.container, &plan, &path, gzip) {
+        Ok((bytes, warnings)) => Ok(Dumped::Written {
+            path,
+            bytes,
+            warnings,
+        }),
+        Err(reason) => {
+            // A half-written dump that looks like a backup is worse than none.
+            let _ = std::fs::remove_file(&path);
+            Err(format!(
+                "{} failed, its file removed: {reason}",
+                service.service
+            ))
+        }
+    }
+}
+
 fn backup(config: &Config, out: &Path, gzip: bool) -> ExitCode {
     let client = match docker_client(config) {
         Ok(client) => client,
@@ -1326,37 +1437,16 @@ fn backup(config: &Config, out: &Path, gzip: bool) -> ExitCode {
     let mut failed = false;
 
     for service in &services {
-        if service.state != ServiceState::Running {
+        match dump_service(&client, config, service, &directory, gzip) {
             // Said out loud rather than skipped in silence: a backup that
             // quietly leaves out a stopped database is the kind of gap nobody
             // finds until they need the file.
-            outln!("skipped {} (not running)", service.service);
-            continue;
-        }
-        let detail = match client.inspect(&service.container) {
-            Ok(detail) => detail,
-            Err(error) => {
-                eprintln!("adev: {}: {error}", service.container);
-                failed = true;
-                continue;
-            }
-        };
-        let Some(engine) = Engine::from_image(&detail.image) else {
-            continue;
-        };
-        let plan = match dump_all_plan(engine, &detail.env, &account_for(config, &service.service))
-        {
-            Ok(plan) => plan,
-            Err(error) => {
-                eprintln!("adev: {}: {error}", service.service);
-                failed = true;
-                continue;
-            }
-        };
-
-        let path = directory.join(backup_filename(&service.service, engine, gzip));
-        match dump_to_file(&client, &service.container, &plan, &path, gzip) {
-            Ok((bytes, warnings)) => {
+            Ok(Dumped::Nothing(reason)) => outln!("skipped {reason}"),
+            Ok(Dumped::Written {
+                path,
+                bytes,
+                warnings,
+            }) => {
                 if !warnings.is_empty() {
                     eprintln!(
                         "adev: {}: {}",
@@ -1368,11 +1458,7 @@ fn backup(config: &Config, out: &Path, gzip: bool) -> ExitCode {
                 written += 1;
             }
             Err(reason) => {
-                let _ = std::fs::remove_file(&path);
-                eprintln!(
-                    "adev: {} failed, its file removed: {reason}",
-                    service.service
-                );
+                eprintln!("adev: {reason}");
                 failed = true;
             }
         }

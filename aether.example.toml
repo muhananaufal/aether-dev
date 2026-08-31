@@ -145,3 +145,10 @@ domains = "domains.toml"
 # interval_secs = 5              # 0 turns the footer numbers off entirely
 # guest = ["wsl", "-d", "Ubuntu", "-u", "root", "free", "-m"]
 # host_process = ["vmmemWSL", "vmmem"]
+
+# Where the dashboard puts a backup. `adev db backup` takes its own --out;
+# this is for the `b` key, which has nowhere to ask.
+#
+# [backup]
+# directory = "backups"
+# gzip = false

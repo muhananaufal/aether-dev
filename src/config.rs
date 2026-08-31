@@ -57,6 +57,8 @@ pub struct Config {
     pub open: OpenConfig,
     /// What the container host costs this machine, shown in the footer.
     pub memory: MemoryConfig,
+    /// Where the dashboard puts a backup, since it has nowhere to ask.
+    pub backup: BackupConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -130,6 +132,28 @@ impl Default for ScanConfig {
             workers: 12,
             git_timeout_ms: 2000,
             cache_ttl_secs: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BackupConfig {
+    /// Where the dashboard writes a backup. The command line takes its own
+    /// `--out`; this is for the key that has nowhere to ask.
+    pub directory: PathBuf,
+    /// Whether those dumps are compressed.
+    pub gzip: bool,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            // Beside wherever the tool was run, like every other default here.
+            // A path under one developer's home is the mistake this project
+            // exists to undo.
+            directory: PathBuf::from("backups"),
+            gzip: false,
         }
     }
 }

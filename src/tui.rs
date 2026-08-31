@@ -738,6 +738,7 @@ const KEYS: &[(&str, &str)] = &[
     ("l", "read the selected service's log"),
     ("t", "open a shell in a project, on its own toolchain"),
     ("e", "open the selected project's folder"),
+    ("b", "back up the selected service's databases"),
     ("r", "refresh this pane"),
     ("R", "refresh everything"),
     ("g", "the settings in force, and where they live"),
