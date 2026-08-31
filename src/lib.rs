@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod db;
 pub mod docker;
 pub mod domain;
 pub mod git;
