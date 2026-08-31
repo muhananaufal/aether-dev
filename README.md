@@ -52,8 +52,11 @@ the file. That matters for `caddyfile` and `domains`, which are written to.
 ```
 adev scan       [--json]              projects, framework and version, branch, changes
 adev services   [--json] [--memory]   containers and whether they are actually usable
-adev ports      [--json]              published ports and whether they answer
-adev start|stop|restart <service...>  for containers that already exist
+adev ports      [--json]              every listening port, and what holds it
+adev kill <port> [--dry-run]          end whatever is holding one
+adev start|stop|restart <service...>|--all
+adev open <service|project>           open it in a browser
+adev dotenv <project> [--use <file>]  which .env it runs with, or switch it
 adev logs <service> [-f] [-n N]       what a service is writing
 adev db export <service> --database <db> --out <file> [--gzip] [--force]
 adev db import <service> --database <db> --file <file>
@@ -86,8 +89,15 @@ question "is the database up" should not need a keystroke to answer.
 ```
 
 `tab` moves the focus, `1`–`3` jump straight to a pane, `j`/`k` move within
-whichever pane has it, `r` refreshes, `q` quits. Each pane keeps its own row,
-so coming back to a list finds it where you left it.
+whichever pane has it, `r` refreshes, `q` quits, and `?` lists every key. Each
+pane keeps its own row, so coming back to a list finds it where you left it.
+
+It acts as well as shows. `s`, `x` and `S` start, stop and restart the selected
+service and `o` opens its port — those finish in a moment and stay inside,
+running on their own thread so the drawing never waits on them. `enter` runs
+the selected project and `t` opens a shell in it; those close the dashboard
+first, because a dev server and a redraw loop fighting over the terminal would
+garble both.
 
 The focused pane is the one with a lit border and a reversed row; the others
 keep a quieter marker so you can still see where you were. Colour carries the
