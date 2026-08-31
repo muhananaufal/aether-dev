@@ -15,6 +15,7 @@ dependencies = [
  "clap",
  "flate2",
  "ratatui",
+ "semver",
  "serde",
  "serde_json",
  "tar",

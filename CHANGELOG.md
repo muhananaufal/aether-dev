@@ -23,6 +23,11 @@ window on one machine.
   from the container's own environment; nothing is stored or asked for.
 - `domains` — local hostnames, with the Caddyfile generated from a single
   source of truth rather than kept in step with it by hand.
+- `env` / `exec` / `shell` — per-project toolchain versions, for the projects
+  that are not in containers. A machine holding PHP 7.4, 8.1, 8.2 and 8.3 side
+  by side runs each project on the one it asks for. A bare version means that
+  version: 7.4 is 7.4.x, not "7.4 or newer", which the semver crate would
+  otherwise read as a caret and answer with 8.3.
 - `tui` — a dashboard over projects, services and ports.
 
 ### Notes
