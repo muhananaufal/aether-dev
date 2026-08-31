@@ -28,6 +28,29 @@ pub struct Config {
     pub project: ProjectConfig,
     pub scan: ScanConfig,
     pub docker: DockerConfig,
+    pub caddy: CaddyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CaddyConfig {
+    /// Container restarted so the proxy picks up a regenerated config.
+    pub container: String,
+    /// The generated reverse-proxy config. Overwritten without asking, so it
+    /// is an output of this tool rather than something to edit.
+    pub caddyfile: PathBuf,
+    /// The source of truth for local hostnames.
+    pub domains: PathBuf,
+}
+
+impl Default for CaddyConfig {
+    fn default() -> Self {
+        Self {
+            container: "caddy-proxy".to_string(),
+            caddyfile: PathBuf::from("Caddyfile"),
+            domains: PathBuf::from("domains.toml"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -135,6 +158,12 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "scan.workers",
                 reason: "must be at least 1",
+            });
+        }
+        if self.caddy.container.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "caddy.container",
+                reason: "must name the container to restart after a change",
             });
         }
         if self.scan.git_timeout_ms == 0 {
@@ -247,5 +276,41 @@ workers = 0
             Config::load(Some(&path)).unwrap_err(),
             ConfigError::Invalid { .. }
         ));
+    }
+    #[test]
+    fn the_proxy_section_has_working_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.caddy.container, "caddy-proxy");
+        assert_eq!(cfg.caddy.caddyfile, PathBuf::from("Caddyfile"));
+        assert_eq!(cfg.caddy.domains, PathBuf::from("domains.toml"));
+    }
+
+    #[test]
+    fn the_proxy_paths_can_be_pointed_somewhere_else() {
+        let cfg = Config::from_toml_str(
+            "[caddy]
+container = \"edge\"
+caddyfile = \"conf/Caddyfile\"
+",
+        )
+        .unwrap();
+        assert_eq!(cfg.caddy.container, "edge");
+        assert_eq!(cfg.caddy.caddyfile, PathBuf::from("conf/Caddyfile"));
+        assert_eq!(
+            cfg.caddy.domains,
+            Config::default().caddy.domains,
+            "what the file does not mention keeps its default"
+        );
+    }
+
+    #[test]
+    fn an_empty_proxy_container_is_rejected_because_nothing_could_be_reloaded() {
+        let err = Config::from_toml_str(
+            "[caddy]
+container = \"\"
+",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
     }
 }
