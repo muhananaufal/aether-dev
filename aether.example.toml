@@ -72,3 +72,17 @@ domains = "domains.toml"
 #
 # [pin.old-billing]
 # php = "7.4"
+
+# How a project starts. The built-ins cover Laravel, CodeIgniter 3 and 4,
+# Django, FastAPI, Next.js, Vite, plain Node, Go, Rust and plain Python.
+#
+# Replace one for every project that uses it:
+# [recipe.laravel]
+# command = "php artisan serve --host=0.0.0.0"
+# port = 8001
+#
+# Or replace it for one project only. A project name beats a recipe name,
+# because it is more specific and because a project can be called "laravel".
+# [run.old-billing]
+# command = "php -S localhost:9000 -t public"
+# port = 9000
