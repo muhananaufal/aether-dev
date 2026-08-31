@@ -1,0 +1,38 @@
+# Secrets & environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# Local state & user data
+/backups/
+state.json
+domains.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & coverage
+*.log
+logs/
+coverage/
