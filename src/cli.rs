@@ -71,6 +71,13 @@ pub enum Command {
         #[arg(required = true)]
         services: Vec<String>,
     },
+    /// End whatever is holding a port.
+    Kill {
+        port: u16,
+        /// Say what would be ended, without ending it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Follow what a service is writing.
     Logs {
         /// Service or container to read.
@@ -516,6 +523,29 @@ mod tests {
         assert!(
             Cli::try_parse_from(["adev", "run"]).is_err(),
             "there is no sensible project to start when none was named"
+        );
+    }
+
+    #[test]
+    fn freeing_a_port_names_the_port_and_can_be_asked_first() {
+        assert_eq!(
+            Cli::parse_from(["adev", "kill", "8000"]).command,
+            Command::Kill {
+                port: 8000,
+                dry_run: false,
+            }
+        );
+        assert!(matches!(
+            Cli::parse_from(["adev", "kill", "8000", "--dry-run"]).command,
+            Command::Kill { dry_run: true, .. }
+        ));
+        assert!(
+            Cli::try_parse_from(["adev", "kill"]).is_err(),
+            "killing whatever happens to be listening is not a default"
+        );
+        assert!(
+            Cli::try_parse_from(["adev", "kill", "not-a-port"]).is_err(),
+            "a port is a number, and refusing early beats failing later"
         );
     }
 }

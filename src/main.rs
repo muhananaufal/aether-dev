@@ -6,6 +6,7 @@ use aether_dev::db::{backup_filename, dump_all_plan, dump_plan, restore_plan, En
 use aether_dev::docker::{probe_all, DockerClient, DockerError, HttpDockerClient};
 use aether_dev::domain::{Project, ServiceState, ServiceStatus};
 use aether_dev::git::GitCli;
+use aether_dev::listen;
 use aether_dev::ports::ScanEvent;
 use aether_dev::ports::{collect, ProjectScanner};
 use aether_dev::proxy::DomainSet;
@@ -70,6 +71,7 @@ fn main() -> ExitCode {
         Command::Scan { json } => scan(&config, json),
         Command::Services { json, memory } => services(&config, json, memory),
         Command::Ports { json } => ports(&config, json),
+        Command::Kill { port, dry_run } => kill(port, dry_run),
         Command::Db(command) => db(&config, command),
         Command::Domains(command) => domains(&config, command),
         Command::Start { services } => lifecycle(&config, &services, Action::Start),
@@ -251,15 +253,52 @@ fn services(config: &Config, json: bool, memory: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[derive(Serialize)]
+struct PortRow<'a> {
+    port: u16,
+    process: Option<&'a str>,
+    pid: Option<u32>,
+    service: Option<&'a str>,
+    answering: bool,
+}
+
+/// Everything listening on this machine, with the docker service named where
+/// one of them is docker.
+///
+/// The question a developer asks is "what is on 8000", and the answer is often
+/// a stray dev server rather than a container. Listing only what docker
+/// published answers a narrower question than the one being asked.
 fn ports(config: &Config, json: bool) -> ExitCode {
-    let services = match load_services(config, false) {
-        Ok(services) => services,
-        Err(code) => return code,
+    let listeners = match listen::listening() {
+        Ok(listeners) => listeners,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
     };
-    let published: Vec<&ServiceStatus> = services.iter().filter(|s| s.port.is_some()).collect();
+
+    // Docker is asked for names, not for the list. If the daemon is down the
+    // ports are still there, and still the thing being asked about.
+    let services = load_services(config, false).unwrap_or_default();
+    let named: std::collections::HashMap<u16, &ServiceStatus> = services
+        .iter()
+        .filter_map(|service| service.port.map(|port| (port, service)))
+        .collect();
 
     if json {
-        return match serde_json::to_string_pretty(&published) {
+        let rows: Vec<PortRow> = listeners
+            .iter()
+            .map(|listener| PortRow {
+                port: listener.port,
+                process: listener.process.as_deref(),
+                pid: listener.pid,
+                service: named.get(&listener.port).map(|s| s.service.as_str()),
+                answering: named
+                    .get(&listener.port)
+                    .is_some_and(|service| service.port_open),
+            })
+            .collect();
+        return match serde_json::to_string_pretty(&rows) {
             Ok(text) => {
                 outln!("{text}");
                 ExitCode::SUCCESS
@@ -271,24 +310,63 @@ fn ports(config: &Config, json: bool) -> ExitCode {
         };
     }
 
-    for service in &published {
+    for listener in &listeners {
+        let service = named
+            .get(&listener.port)
+            .map_or("", |service| service.service.as_str());
         outln!(
-            "{:>6}  {:<18} {}",
-            service.port.unwrap_or_default(),
-            clip(&service.service, 18),
-            if service.port_open {
-                "answering"
-            } else {
-                "no answer"
-            }
+            "{:>6}  {:<28} {:<8} {}",
+            listener.port,
+            clip(listener.process.as_deref().unwrap_or("-"), 28),
+            listener
+                .pid
+                .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+            service
         );
     }
-    let answering = published.iter().filter(|s| s.port_open).count();
     outln!(
-        "\n{} published ports, {answering} answering",
-        published.len()
+        "\n{} ports listening, {} of them docker services",
+        listeners.len(),
+        listeners
+            .iter()
+            .filter(|listener| named.contains_key(&listener.port))
+            .count()
     );
     ExitCode::SUCCESS
+}
+
+fn kill(port: u16, dry_run: bool) -> ExitCode {
+    let listeners = match listen::listening() {
+        Ok(listeners) => listeners,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(listener) = listeners.iter().find(|listener| listener.port == port) else {
+        eprintln!("adev: nothing is listening on {port}");
+        return ExitCode::from(2);
+    };
+    let Some(pid) = listener.pid else {
+        eprintln!("adev: {port} is held by a process this system would not name");
+        return ExitCode::from(2);
+    };
+    let name = listener.process.as_deref().unwrap_or("unnamed process");
+
+    if dry_run {
+        outln!("would end {name} ({pid}), which holds {port}");
+        return ExitCode::SUCCESS;
+    }
+    match listen::terminate(pid) {
+        Ok(()) => {
+            outln!("ended {name} ({pid}); {port} is free");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("adev: {error}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// Starts every collector on its own thread and returns at once. Nothing here
