@@ -202,6 +202,30 @@ impl Config {
     }
 }
 
+/// The name looked for when no configuration file was named on the command
+/// line.
+pub const CONFIG_NAME: &str = "aether.toml";
+
+/// Finds the configuration to use, nearest first.
+///
+/// The current directory and then each parent, so running `adev` from inside a
+/// project still finds the configuration that sits above the whole workspace -
+/// and so a single project can override it by keeping its own. Failing all of
+/// those, the one for this machine.
+///
+/// Having to pass `--config` on every command is the kind of friction that
+/// stops a tool being used at all.
+pub fn discover(start: &Path, machine_wide: Option<&Path>) -> Option<PathBuf> {
+    for directory in start.ancestors() {
+        let candidate = directory.join(CONFIG_NAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    machine_wide
+        .filter(|path| path.is_file())
+        .map(Path::to_path_buf)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +411,63 @@ container = \"\"
         .unwrap();
         assert_eq!(cfg.pin["legacy-billing"]["php"], "5.6");
         assert_eq!(cfg.pin["old-shop"]["node"], "10");
+    }
+
+    #[test]
+    fn a_config_beside_you_is_found_without_being_named() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("aether.toml"), "").unwrap();
+        assert_eq!(
+            discover(dir.path(), None).as_deref(),
+            Some(dir.path().join("aether.toml").as_path())
+        );
+    }
+
+    #[test]
+    fn a_config_further_up_is_found_from_inside_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("aether.toml"), "").unwrap();
+        let deep = dir.path().join("devivace").join("some-app");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(
+            discover(&deep, None).as_deref(),
+            Some(dir.path().join("aether.toml").as_path()),
+            "running adev from inside a project should still find the workspace config"
+        );
+    }
+
+    #[test]
+    fn the_nearest_config_wins_over_one_further_up() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("aether.toml"), "").unwrap();
+        let inner = dir.path().join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("aether.toml"), "").unwrap();
+        assert_eq!(
+            discover(&inner, None).as_deref(),
+            Some(inner.join("aether.toml").as_path())
+        );
+    }
+
+    #[test]
+    fn the_machine_wide_config_is_used_when_nothing_is_nearby() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home").join("aether.toml");
+        std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+        std::fs::write(&home, "").unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        assert_eq!(
+            discover(&empty, Some(&home)).as_deref(),
+            Some(home.as_path())
+        );
+    }
+
+    #[test]
+    fn a_machine_wide_path_that_does_not_exist_is_not_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nowhere").join("aether.toml");
+        assert_eq!(discover(dir.path(), Some(&missing)), None);
     }
 }
