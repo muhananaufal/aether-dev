@@ -1,0 +1,13 @@
+[package]
+name = "aether-dev"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "Terminal dashboard for a local development environment"
+repository = "https://github.com/muhananaufal/aether-dev"
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+toml = "1.1.4"
