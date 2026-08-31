@@ -11,7 +11,7 @@ use aether_dev::ports::{collect, ProjectScanner};
 use aether_dev::proxy::DomainSet;
 use aether_dev::scan::FsProjectScanner;
 use aether_dev::toolchain::{self, Reason, Resolution};
-use aether_dev::tui::{Dashboard, Tab, Update};
+use aether_dev::tui::{Dashboard, Pane, Update};
 use clap::Parser;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -359,10 +359,11 @@ fn tui(config: &Config) -> ExitCode {
             }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                KeyCode::Tab | KeyCode::Right => dashboard.next_tab(),
-                KeyCode::Char('1') => dashboard.set_tab(Tab::Projects),
-                KeyCode::Char('2') => dashboard.set_tab(Tab::Services),
-                KeyCode::Char('3') => dashboard.set_tab(Tab::Ports),
+                KeyCode::Tab | KeyCode::Right => dashboard.focus_next(),
+                KeyCode::BackTab | KeyCode::Left => dashboard.focus_previous(),
+                KeyCode::Char('1') => dashboard.focus_on(Pane::Projects),
+                KeyCode::Char('2') => dashboard.focus_on(Pane::Services),
+                KeyCode::Char('3') => dashboard.focus_on(Pane::Ports),
                 KeyCode::Char('j') | KeyCode::Down => dashboard.move_selection(1),
                 KeyCode::Char('k') | KeyCode::Up => dashboard.move_selection(-1),
                 KeyCode::PageDown => dashboard.move_selection(10),
