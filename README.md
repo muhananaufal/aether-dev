@@ -118,6 +118,11 @@ question "is the database up" should not need a keystroke to answer.
  8 projects of 34 directories · 3 ready of 5 services
 ```
 
+`enter` on any row lists what you can do with it, in words, with the key that
+does each one beside it — so nothing has to be memorised, and the shortcuts are
+learned by using the menu rather than by reading a list. Choosing an entry is
+the same as pressing that key: one path through the code, not two.
+
 `tab` moves the focus, `1`–`3` jump straight to a pane, `j`/`k` move within
 whichever pane has it, `q` quits, and `?` lists every key. Each pane keeps its
 own row, so coming back to a list finds it where you left it.
@@ -142,7 +147,7 @@ it, and an arriving notice cannot take the line out from under a half-typed
 answer. `.` shows the project's `.env` variants while you type which one to
 switch to, because nobody remembers the exact spelling of all of them.
 
-`enter` runs the selected project, `t` opens a shell in it, and `:` runs one
+`p` runs the selected project, `t` opens a shell in it, and `:` runs one
 command in it. Those close the dashboard first, because a dev server and a
 redraw loop fighting over the terminal would garble both.
 
@@ -375,6 +380,8 @@ reports.
   failing with a daemon error.
 - `--memory` costs about a second and a half per container, which is why the
   listing does not include it by default.
+- Below 100 columns the three panes become one at a time, with a strip naming
+  the other two. A terminal that narrow cannot show three readable columns.
 - The dashboard's prompt is one line of plain text: no history, no completion,
   and no file picker. A dump file is typed as a path.
 - Not carried over from the predecessor, deliberately: ejecting a drive, and
