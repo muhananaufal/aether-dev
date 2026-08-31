@@ -4,7 +4,7 @@ use aether_dev::cli::{Cli, Command, DbCommand, DomainCommand};
 use aether_dev::config::Config;
 use aether_dev::db::{dump_plan, restore_plan, Engine};
 use aether_dev::docker::{probe_all, DockerClient, DockerError, HttpDockerClient};
-use aether_dev::domain::{Project, ServiceStatus};
+use aether_dev::domain::{Project, ServiceState, ServiceStatus};
 use aether_dev::git::GitCli;
 use aether_dev::ports::ScanEvent;
 use aether_dev::ports::{collect, ProjectScanner};
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
 
     match cli.command {
         Command::Scan { json } => scan(&config, json),
-        Command::Services { json } => services(&config, json),
+        Command::Services { json, memory } => services(&config, json, memory),
         Command::Ports { json } => ports(&config, json),
         Command::Db(command) => db(&config, command),
         Command::Domains(command) => domains(&config, command),
@@ -164,19 +164,22 @@ fn docker_client(config: &Config) -> Result<HttpDockerClient, ExitCode> {
     })
 }
 
-fn load_services(config: &Config) -> Result<Vec<ServiceStatus>, ExitCode> {
+fn load_services(config: &Config, memory: bool) -> Result<Vec<ServiceStatus>, ExitCode> {
     let client = docker_client(config)?;
     let mut services = client.services().map_err(|error| {
         eprintln!("adev: {error}");
         ExitCode::from(2)
     })?;
     probe_all(&mut services, PORT_PROBE);
+    if memory {
+        fill_memory(&client, &mut services);
+    }
     services.sort_by(|a, b| a.service.cmp(&b.service));
     Ok(services)
 }
 
-fn services(config: &Config, json: bool) -> ExitCode {
-    let services = match load_services(config) {
+fn services(config: &Config, json: bool, memory: bool) -> ExitCode {
+    let services = match load_services(config, memory) {
         Ok(services) => services,
         Err(code) => return code,
     };
@@ -195,8 +198,15 @@ fn services(config: &Config, json: bool) -> ExitCode {
     }
 
     for service in &services {
+        // The column only appears when it was asked for, so the usual listing
+        // is not padded with dashes for a reading nobody wanted.
+        let usage = if memory {
+            format!("  {:>9}", megabytes(service.memory_bytes))
+        } else {
+            String::new()
+        };
         outln!(
-            "{:<18} {:<24} {:<7} {}",
+            "{:<18} {:<24} {:<7} {:<9}{usage}",
             clip(&service.service, 18),
             clip(&service.container, 24),
             service
@@ -211,7 +221,7 @@ fn services(config: &Config, json: bool) -> ExitCode {
 }
 
 fn ports(config: &Config, json: bool) -> ExitCode {
-    let services = match load_services(config) {
+    let services = match load_services(config, false) {
         Ok(services) => services,
         Err(code) => return code,
     };
@@ -847,5 +857,45 @@ fn lifecycle(config: &Config, names: &[String], action: Action) -> ExitCode {
         ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Fills in memory use for the containers that are running, all at once.
+///
+/// Sequentially this would cost about a second and a half per container. Only
+/// running containers are asked, because a stopped one has nothing to report
+/// and would spend the same time saying so.
+fn fill_memory(client: &HttpDockerClient, services: &mut [ServiceStatus]) {
+    let readings: Vec<_> = services
+        .iter()
+        .map(|service| {
+            let container = service.container.clone();
+            let running = service.state == ServiceState::Running;
+            let endpoint = client.endpoint().to_string();
+            std::thread::spawn(move || {
+                if !running {
+                    return None;
+                }
+                HttpDockerClient::new(&endpoint, None)
+                    .ok()?
+                    .memory(&container)
+                    .ok()
+                    .flatten()
+            })
+        })
+        .collect();
+
+    for (service, reading) in services.iter_mut().zip(readings) {
+        service.memory_bytes = reading.join().unwrap_or(None);
+    }
+}
+
+/// Bytes as something a person reads at a glance.
+fn megabytes(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => format!("{} MB", bytes / 1_048_576),
+        // Absent rather than zero: nobody should read a missing reading as a
+        // measurement of nothing.
+        None => "-".to_string(),
     }
 }

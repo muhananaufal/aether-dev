@@ -35,6 +35,11 @@ pub enum Command {
     Services {
         #[arg(long)]
         json: bool,
+        /// Also report how much memory each one is using. Left out by default
+        /// because the daemon takes about a second and a half per container to
+        /// answer, which would make the common listing pay for the rare one.
+        #[arg(long)]
+        memory: bool,
     },
     /// Show which service ports are answering.
     Ports {
@@ -156,7 +161,10 @@ mod tests {
         );
         assert_eq!(
             Cli::parse_from(["adev", "services", "--json"]).command,
-            Command::Services { json: true }
+            Command::Services {
+                json: true,
+                memory: false
+            }
         );
         assert_eq!(
             Cli::parse_from(["adev", "ports", "--json"]).command,
@@ -367,5 +375,24 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["adev", "start"]).is_err());
         assert!(Cli::try_parse_from(["adev", "restart"]).is_err());
+    }
+
+    #[test]
+    fn memory_is_asked_for_explicitly_because_it_is_slow() {
+        assert_eq!(
+            Cli::parse_from(["adev", "services"]).command,
+            Command::Services {
+                json: false,
+                memory: false
+            },
+            "a listing must stay fast by default"
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "services", "--memory"]).command,
+            Command::Services {
+                json: false,
+                memory: true
+            }
+        );
     }
 }

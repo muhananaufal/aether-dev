@@ -120,6 +120,47 @@ fn prefer_ipv4(host: &str) -> String {
     }
 }
 
+#[derive(Deserialize)]
+struct ApiStats {
+    #[serde(rename = "memory_stats", default)]
+    memory: Option<ApiMemory>,
+}
+
+#[derive(Deserialize)]
+struct ApiMemory {
+    usage: Option<u64>,
+    #[serde(default)]
+    stats: Option<ApiMemoryDetail>,
+}
+
+#[derive(Deserialize)]
+struct ApiMemoryDetail {
+    /// cgroup v2 calls the reclaimable page cache this.
+    inactive_file: Option<u64>,
+    /// cgroup v1 calls the same thing this.
+    cache: Option<u64>,
+}
+
+/// What a container is actually using, with the page cache taken out.
+///
+/// The raw `usage` counts file cache the kernel would drop under pressure, so
+/// reporting it as the container's own memory overstates it - on this machine
+/// by 226 MB out of 752. `docker stats` subtracts the same figure, so the
+/// number here matches what the familiar tool shows.
+///
+/// Anything unreadable, or a container that is not running, is absent rather
+/// than zero: nobody should read "0 MB" as a measurement.
+pub fn parse_memory(json: &str) -> Option<u64> {
+    let stats: ApiStats = serde_json::from_str(json).ok()?;
+    let memory = stats.memory?;
+    let usage = memory.usage?;
+    let cache = memory
+        .stats
+        .and_then(|detail| detail.inactive_file.or(detail.cache))
+        .unwrap_or(0);
+    Some(usage.saturating_sub(cache))
+}
+
 /// Resolves the configured endpoint into an HTTP base URL, following
 /// `DOCKER_HOST` when the config says `auto` the way other docker clients do.
 pub fn base_url(endpoint: &str, docker_host: Option<&str>) -> Result<String, DockerError> {
@@ -443,6 +484,22 @@ impl HttpDockerClient {
             std::io::copy(&mut reader, out).map(|_| ())
         };
         outcome.map_err(|error| self.unreachable(error.to_string()))
+    }
+
+    /// Reads one container's memory use.
+    ///
+    /// Measured on this machine at around 1.5 seconds per container, which is
+    /// why nothing calls it unless asked: adding it to every listing would
+    /// make the common case pay for the rare one.
+    pub fn memory(&self, container: &str) -> Result<Option<u64>, DockerError> {
+        let url = format!("{}/containers/{container}/stats?stream=false", self.base);
+        let body = ureq::get(&url)
+            .call()
+            .map_err(|error| self.unreachable(error.to_string()))?
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| self.unreachable(error.to_string()))?;
+        Ok(parse_memory(&body))
     }
 
     pub fn inspect(&self, container: &str) -> Result<ContainerDetail, DockerError> {
@@ -801,5 +858,52 @@ mod tests {
             "a log is a conversation between the two streams; separating them loses \
              which line came first"
         );
+    }
+
+    /// Shaped like this machine's daemon answers, with the numbers it gave.
+    const REAL_STATS: &str = r#"{
+      "memory_stats": {
+        "usage": 752283648,
+        "max_usage": 800000000,
+        "limit": 8332890112,
+        "stats": { "inactive_file": 226324480, "active_file": 1000 }
+      }
+    }"#;
+
+    #[test]
+    fn memory_excludes_page_cache_the_way_docker_stats_does() {
+        assert_eq!(
+            parse_memory(REAL_STATS),
+            Some(752283648 - 226324480),
+            "reporting raw usage counts the page cache as the container's own, \
+             which overstates it by hundreds of megabytes"
+        );
+    }
+
+    #[test]
+    fn an_older_cgroup_layout_reports_the_same_thing_under_another_name() {
+        let v1 = r#"{"memory_stats":{"usage":1000,"stats":{"cache":400}}}"#;
+        assert_eq!(parse_memory(v1), Some(600));
+    }
+
+    #[test]
+    fn a_stopped_container_reports_no_memory_rather_than_zero() {
+        assert_eq!(parse_memory(r#"{"memory_stats":{}}"#), None);
+        assert_eq!(parse_memory("{}"), None);
+    }
+
+    #[test]
+    fn a_cache_larger_than_the_usage_does_not_wrap_around() {
+        let odd = r#"{"memory_stats":{"usage":100,"stats":{"inactive_file":999}}}"#;
+        assert_eq!(
+            parse_memory(odd),
+            Some(0),
+            "subtracting past zero on unsigned numbers would report gigabytes"
+        );
+    }
+
+    #[test]
+    fn stats_that_cannot_be_read_are_absent_rather_than_an_error() {
+        assert_eq!(parse_memory("not json"), None);
     }
 }
