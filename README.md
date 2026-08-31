@@ -72,6 +72,10 @@ never set until you see a zero beside it.
 Inside the dashboard, `g` shows the same thing. It is read-only there on
 purpose: the file carries comments explaining each choice, and rewriting it
 from a form would throw those away every time somebody changed a number.
+
+Where a service's password comes from is shown; the password itself never is.
+Both of these outputs get pasted into bug reports.
+
 ## Commands
 
 ```
@@ -106,8 +110,8 @@ question "is the database up" should not need a keystroke to answer.
 ```
 ┌ 1 Projects ─────────────────────────────┬ 2 Services ──────────────┐
 │ PROJECT          FRAMEWORK      BRANCH  │ SERVICE      PORT  STATE  │
-│ altrms           Laravel 9.52   fix/…   │ mysql        3306  ready  │
-│ manunggal-queue  Laravel 11.54  featu…  │ redis        6379  stopped│
+│ billing-api      Laravel 9.52   fix/…   │ mysql        3306  ready  │
+│ orders-queue     Laravel 11.54  featu…  │ redis        6379  stopped│
 │ …                                       ├ 3 Ports ─────────────────┤
 │                                         │ 3306  mysql   answering   │
 └ 8 of 34 examined ───────────────────────┴ 3 of 5 answering ─────────┘
@@ -115,15 +119,25 @@ question "is the database up" should not need a keystroke to answer.
 ```
 
 `tab` moves the focus, `1`–`3` jump straight to a pane, `j`/`k` move within
-whichever pane has it, `r` refreshes, `q` quits, and `?` lists every key. Each
-pane keeps its own row, so coming back to a list finds it where you left it.
+whichever pane has it, `q` quits, and `?` lists every key. Each pane keeps its
+own row, so coming back to a list finds it where you left it.
+
+`r` refreshes the pane you are looking at and `R` refreshes everything.
+Rescanning every repository to find out whether a container came back up is a
+wait nobody asked for, so the quick answer does not queue behind the slow one.
 
 It acts as well as shows. `s`, `x` and `S` start, stop and restart the selected
-service and `o` opens its port — those finish in a moment and stay inside,
-running on their own thread so the drawing never waits on them. `enter` runs
-the selected project and `t` opens a shell in it; those close the dashboard
-first, because a dev server and a redraw loop fighting over the terminal would
-garble both.
+service, `o` opens its page or its port, `b` dumps its databases, and `e` opens
+the selected project's folder — those finish without taking the screen, running
+on their own threads so the drawing never waits on them. `enter` runs the
+selected project and `t` opens a shell in it; those close the dashboard first,
+because a dev server and a redraw loop fighting over the terminal would garble
+both.
+
+The footer carries two numbers about the container host: how much memory is in
+use inside the machine docker runs in, and what that machine costs this one.
+The second is usually what explains a struggling laptop and cannot be seen from
+inside it.
 
 The focused pane is the one with a lit border and a reversed row; the others
 keep a quieter marker so you can still see where you were. Colour carries the
@@ -138,7 +152,7 @@ with its own toolchain in front on PATH — so a Laravel 5.8 project boots on
 PHP 7.4 while the shell around it still has 8.2.
 
 ```
-$ adev run sapta-web
+$ adev run shop-web
 adev: php artisan serve · http://localhost:8000
 Laravel development server started: <http://127.0.0.1:8000>
 [...] PHP 7.4.33 Development Server (http://127.0.0.1:8000) started
@@ -147,8 +161,8 @@ Laravel development server started: <http://127.0.0.1:8000>
 `--print` says what would happen without doing it:
 
 ```
-$ adev run sapta-web --print
-sapta-web  C:/Projects/devivace/sapta-web
+$ adev run shop-web --print
+shop-web  C:/Projects/clients/shop-web
   recipe   laravel
   command  php artisan serve
   address  http://localhost:8000
@@ -257,11 +271,59 @@ endpoint = "auto"              # auto follows DOCKER_HOST
 container = "caddy-proxy"
 caddyfile = "Caddyfile"        # generated; do not edit by hand
 domains = "domains.toml"       # the source of truth for hostnames
+
+[open]                         # defaults to the platform's own openers
+browser = ["firefox", "{}"]    # {} is where the target goes
+file_manager = ["code", "{}"]
+
+[backup]
+directory = "backups"          # where the dashboard's b key writes
+gzip = false
+
+[memory]                       # the two numbers in the footer
+interval_secs = 5              # 0 turns them off
+guest = ["wsl", "free", "-m"]  # read the way free -m prints
+host_process = ["vmmemWSL", "vmmem"]
 ```
 
 An unknown key is an error rather than a typo that passes silently. A
 configuration that parses but cannot work — no project roots, zero workers —
 is refused at startup with the field named.
+
+### Declaring services
+
+Docker can only report containers that exist. A service defined in a compose
+file but never started is exactly the one you open a dashboard to start, so
+declaring it makes it visible — shown as `absent` until something creates it.
+
+It is also where the details stop being this tool's guesses.
+
+```toml
+[service.mysql]
+container = "mysql-db"             # default: the service's own name
+port = 3306                        # kept on the row even while it is stopped
+domain = "db.test"                 # routed by Caddy, to the container
+panel = "http://localhost:8080"    # what `o` opens
+user = "root"                      # who a dump connects as
+password_env = "MYSQL_ROOT_PASSWORD"   # or `password` for a literal
+
+[service.redis]                    # a name alone is enough
+```
+
+A declared port also fixes something visible on any machine: a stopped
+container publishes no ports, so its row lost its port number at exactly the
+moment you needed it to start the thing again. What a running container
+actually publishes still wins over what was written down.
+
+Credentials are still read from the container's own environment. These settings
+only cover the containers built by hand, the ones that keep their password
+somewhere else, and the dumps that should run as somebody other than the
+superuser.
+
+A service's `domain` is merged into the generated Caddyfile and never written
+back into `domains.toml`, so the hostname stays a fact about the service
+instead of being copied into an artefact that could then disagree with it. A
+host claimed by both is refused by name.
 
 ## Reaching Docker
 
@@ -290,18 +352,24 @@ reports.
 - MySQL and Postgres keep the password out of the command line;
   `mongodump` offers no equivalent, so for Mongo it is visible in that
   container's process list while the dump runs.
-- `start` acts on containers that exist. A service the compose file describes
-  but that has never been created has nothing to start, and says so.
+- `start` acts on containers that exist. A declared service that has never been
+  created is listed as `absent` and says what to run to create it, rather than
+  failing with a daemon error.
 - `--memory` costs about a second and a half per container, which is why the
   listing does not include it by default.
-- The dashboard shows projects, services and ports. Logs and memory are
-  commands only.
-- Not carried over from the predecessor, deliberately: opening a folder, an
-  editor or Postman. Those were buttons because the old tool was a window; in
-  a terminal you are already where `cd` and your editor live.
+- The dashboard can dump a service's databases but not load one back: import
+  needs a file path and a database name, and there is nowhere to type yet.
+- Not carried over from the predecessor, deliberately: ejecting a drive, and
+  the buttons for one particular editor. Those were buttons because the old
+  tool was a window and knew one machine's layout.
 - `env` and `exec` only consider a tool when the project was pinned to it or
-  carries the manifest that tool reads. A project that never mentions Node
-  does not get one put in front of it.
+  holds one of the files that tool's `when` lists. A project that never
+  mentions Node does not get one put in front of it.
+- Nothing yet reads a wanted version out of a `go.mod` or a `pyproject.toml`,
+  so for those a pin or the newest installed decides.
+- The memory footer reads `free` inside the guest and `tasklist` on Windows.
+  On macOS the backing process is named differently between Docker Desktop
+  versions, so `host_process` is empty there until somebody sets it.
 - The Caddyfile is rewritten from the domains file. Anything added to it by
   hand is lost on the next change.
 

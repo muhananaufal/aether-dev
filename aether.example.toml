@@ -86,3 +86,69 @@ domains = "domains.toml"
 # [run.old-billing]
 # command = "php -S localhost:9000 -t public"
 # port = 9000
+
+# A toolchain applies to a project that holds one of these files. Without it,
+# php assumes composer.json and node assumes package.json, and anything else
+# applies only where a [pin] names it — so this is how Go, Python or Ruby
+# become relevant without the tool having to know the language exists.
+#
+# [toolchain.go]
+# search = ["C:/Go"]
+# binary = "go.exe"
+# bin_subdir = "bin"
+# when = ["go.mod"]
+
+# The services this machine is meant to have.
+#
+# Without this section the list is whatever docker reports, which can only ever
+# be containers that already exist. A service you have defined but never
+# started is exactly the one you open a dashboard to start, so declaring it
+# here makes it visible - shown as "absent" until something creates it.
+#
+# It is also where the details stop being this tool's guesses. The container
+# name, the published port, the hostname and the database user are yours.
+#
+# [service.mysql]
+# container = "mysql-db"        # defaults to the name of the service itself
+# port = 3306                   # kept on the row even while the container is stopped
+# domain = "db.test"            # hostname for `adev domains`
+# panel = "http://localhost:8080"   # a page to open with `o`
+# user = "root"                 # the user a dump connects as
+# password_env = "MYSQL_ROOT_PASSWORD"  # where the password lives in the container
+#
+# A service with no container of its own needs nothing but a name:
+# [service.redis]
+
+# How this machine opens things. The defaults are the obvious ones for the
+# platform - `explorer` here, `open` on macOS, `xdg-open` elsewhere - and every
+# one of them is wrong for somebody, so both are templates you can replace.
+#
+# {} is where the URL or the folder goes. A template that never mentions it
+# gets the target appended, which is what most openers want anyway.
+#
+# [open]
+# browser = ["firefox", "--new-window", "{}"]
+# file_manager = ["code", "{}"]
+
+# What the container host costs, shown in the dashboard footer and by
+# `adev services --memory`.
+#
+# Two different numbers on Windows: how much memory is in use inside the
+# machine docker runs in, and what that machine costs Windows. The second is
+# usually the one that explains a struggling laptop, and it cannot be seen from
+# inside. On native Linux docker there is no second number, so host_process is
+# empty there.
+#
+# The guest command's output is read the way `free -m` prints it.
+#
+# [memory]
+# interval_secs = 5              # 0 turns the footer numbers off entirely
+# guest = ["wsl", "-d", "Ubuntu", "-u", "root", "free", "-m"]
+# host_process = ["vmmemWSL", "vmmem"]
+
+# Where the dashboard puts a backup. `adev db backup` takes its own --out;
+# this is for the `b` key, which has nowhere to ask.
+#
+# [backup]
+# directory = "backups"
+# gzip = false

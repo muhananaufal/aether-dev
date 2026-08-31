@@ -2,6 +2,9 @@
 //! is a constant in the code: the previous tool hard-coded one machine's
 //! layout and could therefore never run on anyone else's.
 
+use crate::catalog::ServiceConfig;
+use crate::memory::MemoryConfig;
+use crate::open::OpenConfig;
 use crate::recipe::RunOverride;
 use crate::toolchain::ToolConfig;
 use serde::Deserialize;
@@ -45,6 +48,17 @@ pub struct Config {
     /// How to start one named project, which beats the recipe because it is
     /// more specific — and because a project can be called `laravel`.
     pub run: HashMap<String, RunOverride>,
+    /// The services this machine is meant to have. Declaring one makes it
+    /// visible before it exists, which is the only way a dashboard can be used
+    /// to create it — and it is where the container name, port, hostname and
+    /// database credentials stop being this tool's guesses.
+    pub service: HashMap<String, ServiceConfig>,
+    /// How this machine hands a URL or a directory to the rest of the desktop.
+    pub open: OpenConfig,
+    /// What the container host costs this machine, shown in the footer.
+    pub memory: MemoryConfig,
+    /// Where the dashboard puts a backup, since it has nowhere to ask.
+    pub backup: BackupConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -124,6 +138,28 @@ impl Default for ScanConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+pub struct BackupConfig {
+    /// Where the dashboard writes a backup. The command line takes its own
+    /// `--out`; this is for the key that has nowhere to ask.
+    pub directory: PathBuf,
+    /// Whether those dumps are compressed.
+    pub gzip: bool,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            // Beside wherever the tool was run, like every other default here.
+            // A path under one developer's home is the mistake this project
+            // exists to undo.
+            directory: PathBuf::from("backups"),
+            gzip: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct DockerConfig {
     /// How to reach the Docker daemon. `auto` means "work it out at connect
     /// time"; that resolution is not implemented yet and is the last open
@@ -152,6 +188,19 @@ impl Config {
             source,
         })?;
         Self::from_toml_str(&text)
+    }
+
+    /// The declared services, in a fixed order. A map has none, and a list of
+    /// services that reshuffles itself between refreshes cannot be selected
+    /// from.
+    pub fn services_declared(&self) -> Vec<(String, ServiceConfig)> {
+        let mut declared: Vec<(String, ServiceConfig)> = self
+            .service
+            .iter()
+            .map(|(name, settings)| (name.clone(), settings.clone()))
+            .collect();
+        declared.sort_by(|a, b| a.0.cmp(&b.0));
+        declared
     }
 
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
@@ -210,6 +259,27 @@ impl Config {
                 field: "caddy.container",
                 reason: "must name the container to restart after a change",
             });
+        }
+        for (name, service) in &self.service {
+            if service
+                .container
+                .as_ref()
+                .is_some_and(|c| c.trim().is_empty())
+            {
+                let _ = name;
+                return Err(ConfigError::Invalid {
+                    field: "service.container",
+                    reason: "must name a container, or be left out to use the service name",
+                });
+            }
+            // Two passwords is not twice as configured, it is a question about
+            // which one is live that nobody should have to answer by experiment.
+            if service.password.is_some() && service.password_env.is_some() {
+                return Err(ConfigError::Invalid {
+                    field: "service.password",
+                    reason: "cannot be set alongside password_env; choose one",
+                });
+            }
         }
         if self.scan.git_timeout_ms == 0 {
             return Err(ConfigError::Invalid {
@@ -518,7 +588,7 @@ container = \"\"
     fn a_config_further_up_is_found_from_inside_a_project() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("aether.toml"), "").unwrap();
-        let deep = dir.path().join("devivace").join("some-app");
+        let deep = dir.path().join("clients").join("some-app");
         std::fs::create_dir_all(&deep).unwrap();
         assert_eq!(
             discover(&deep, None).as_deref(),
@@ -649,6 +719,77 @@ container = \"\"
         std::fs::create_dir_all(dir.path().join("projects")).unwrap();
         let written = starter(&[dir.path().join("projects")], &[], None);
         Config::from_toml_str(&written).expect("what init writes must load");
+    }
+
+    #[test]
+    fn no_service_is_declared_by_default_because_docker_is_asked_instead() {
+        assert!(Config::default().service.is_empty());
+    }
+
+    #[test]
+    fn a_service_can_name_its_container_port_domain_and_credentials() {
+        let cfg = Config::from_toml_str(
+            "[service.mysql]
+container = \"mysql-db\"
+port = 3306
+domain = \"db.test\"
+panel = \"http://localhost:8080\"
+user = \"root\"
+password_env = \"MYSQL_ROOT_PASSWORD\"
+",
+        )
+        .unwrap();
+        let mysql = &cfg.service["mysql"];
+        assert_eq!(mysql.container.as_deref(), Some("mysql-db"));
+        assert_eq!(mysql.port, Some(3306));
+        assert_eq!(mysql.domain.as_deref(), Some("db.test"));
+        assert_eq!(mysql.user.as_deref(), Some("root"));
+        assert_eq!(mysql.password_env.as_deref(), Some("MYSQL_ROOT_PASSWORD"));
+        assert_eq!(mysql.password, None);
+    }
+
+    #[test]
+    fn a_service_may_be_declared_with_nothing_but_a_name() {
+        let cfg = Config::from_toml_str("[service.redis]\n").unwrap();
+        assert_eq!(
+            cfg.service["redis"].container_for("redis"),
+            "redis",
+            "naming a service is enough to want it listed"
+        );
+    }
+
+    #[test]
+    fn a_service_that_gives_a_password_two_ways_is_refused() {
+        let err = Config::from_toml_str(
+            "[service.mysql]
+password = \"literal\"
+password_env = \"MYSQL_ROOT_PASSWORD\"
+",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_service_whose_container_name_is_blank_is_refused() {
+        let err = Config::from_toml_str("[service.mysql]\ncontainer = \" \"\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn declared_services_come_back_in_a_stable_order() {
+        let cfg = Config::from_toml_str("[service.redis]\n[service.mysql]\n[service.postgres]\n")
+            .unwrap();
+        let names: Vec<String> = cfg
+            .services_declared()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["mysql", "postgres", "redis"],
+            "a map has no order, and a list that reshuffles itself is unusable"
+        );
     }
 
     #[test]

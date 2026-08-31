@@ -5,6 +5,7 @@
 //! how a collector is allowed to report, and `cli` is the non-interactive
 //! surface that the terminal UI is later layered on top of.
 
+pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod db;
@@ -14,6 +15,8 @@ pub mod dotenv;
 pub mod framework;
 pub mod git;
 pub mod listen;
+pub mod memory;
+pub mod open;
 pub mod ports;
 pub mod proxy;
 pub mod recipe;

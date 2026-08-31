@@ -11,6 +11,7 @@
 //! drawing never waits on one — the rule the predecessor broke.
 
 use crate::domain::{GitStatus, Project, ServiceState, ServiceStatus};
+use crate::memory;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -97,6 +98,8 @@ pub enum Update {
         scanned: usize,
     },
     Services(Vec<ServiceStatus>),
+    /// What the container host is costing, re-read on a timer.
+    Memory(memory::Reading),
     ServicesFailed(String),
     /// What an action the user asked for is doing. Actions run on their own
     /// threads, so the only way they can report is the same way collectors do.
@@ -222,6 +225,9 @@ pub struct Dashboard {
     /// which keeps it free of anything that touches a file.
     settings: Vec<(String, String)>,
     showing_settings: bool,
+    /// What the container host is costing this machine. Polled on its own
+    /// timer, so a slow probe cannot hold up the rest of the screen.
+    memory: memory::Reading,
 }
 
 impl Default for Dashboard {
@@ -246,12 +252,14 @@ impl Dashboard {
             logs: None,
             settings: Vec::new(),
             showing_settings: false,
+            memory: memory::Reading::default(),
         }
     }
 
     pub fn apply(&mut self, update: Update) {
         match update {
             Update::Project(project) => self.projects.push(project),
+            Update::Memory(reading) => self.memory = reading,
             Update::ScanFailed { path, reason } => self.scan_failures.push((path, reason)),
             Update::ScanFinished { scanned } => self.scanned = Some(scanned),
             Update::Services(services) => {
@@ -688,7 +696,32 @@ impl Dashboard {
             }
         }
 
+        // What the container host is costing, last of all: it is the number
+        // you glance at rather than the one you came for.
+        if let Some(bytes) = self.memory.guest_bytes {
+            spans.push(Span::styled(format!("   ram {}", human_bytes(bytes)), dim));
+        }
+        if let Some((process, bytes)) = &self.memory.host {
+            spans.push(Span::styled(
+                format!(" · {process} {}", human_bytes(*bytes)),
+                dim,
+            ));
+        }
+
         Paragraph::new(Line::from(spans))
+    }
+}
+
+/// Bytes at the precision a glance can use: a footer that reads 1.43 GB when
+/// the number is moving every few seconds is harder to read, not more accurate.
+fn human_bytes(bytes: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes / GB)
+    } else {
+        format!("{:.0} MB", bytes / MB)
     }
 }
 
@@ -700,11 +733,14 @@ const KEYS: &[(&str, &str)] = &[
     ("s", "start the selected service"),
     ("x", "stop it"),
     ("S", "restart it"),
-    ("o", "open its port in a browser"),
+    ("o", "open its page, or its port, in a browser"),
     ("enter", "run the selected project"),
     ("l", "read the selected service's log"),
     ("t", "open a shell in a project, on its own toolchain"),
-    ("r", "refresh everything"),
+    ("e", "open the selected project's folder"),
+    ("b", "back up the selected service's databases"),
+    ("r", "refresh this pane"),
+    ("R", "refresh everything"),
     ("g", "the settings in force, and where they live"),
     ("?", "this list"),
     ("q", "quit"),
@@ -762,6 +798,12 @@ fn condition_style(service: &ServiceStatus) -> Style {
             .add_modifier(Modifier::BOLD),
         (ServiceState::Running, false) => Style::default().fg(paint::WAITING),
         (ServiceState::Stopped, _) => Style::default().fg(paint::MUTED),
+        // Italic rather than another colour: absent is not a worse kind of
+        // stopped, it is a service that was never created, and the row exists
+        // to be acted on rather than worried about.
+        (ServiceState::Absent, _) => Style::default()
+            .fg(paint::MUTED)
+            .add_modifier(Modifier::ITALIC),
     }
 }
 
@@ -972,6 +1014,43 @@ mod tests {
     fn column_of(line: &str, needle: &str) -> Option<u16> {
         let byte = line.find(needle)?;
         Some(line[..byte].chars().count() as u16)
+    }
+
+    #[test]
+    fn the_footer_shows_what_the_container_host_costs() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.apply(Update::Services(Vec::new()));
+        dashboard.apply(Update::Memory(memory::Reading {
+            guest_bytes: Some(1423 * 1024 * 1024),
+            host: Some(("vmmemWSL".to_string(), 855_312 * 1024)),
+        }));
+
+        let buffer = drawn(&mut dashboard, 160, 20);
+        let footer = lines(&buffer).pop().expect("a status line");
+        assert!(footer.contains("ram 1.4 GB"), "got {footer:?}");
+        assert!(footer.contains("vmmemWSL 835 MB"), "got {footer:?}");
+    }
+
+    #[test]
+    fn a_machine_with_nothing_to_measure_shows_no_memory_at_all() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.apply(Update::Services(Vec::new()));
+
+        let buffer = drawn(&mut dashboard, 160, 20);
+        let footer = lines(&buffer).pop().expect("a status line");
+        assert!(
+            !footer.contains("ram"),
+            "an unmeasured number must not read as zero; got {footer:?}"
+        );
+    }
+
+    #[test]
+    fn bytes_are_shown_at_the_precision_a_glance_can_use() {
+        assert_eq!(human_bytes(855_312 * 1024), "835 MB");
+        assert_eq!(human_bytes(1423 * 1024 * 1024), "1.4 GB");
+        assert_eq!(human_bytes(0), "0 MB");
     }
 
     fn screen(buffer: &Buffer) -> String {

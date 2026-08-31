@@ -566,16 +566,16 @@ mod tests {
     #[test]
     fn a_project_can_be_started_or_only_described() {
         assert_eq!(
-            Cli::parse_from(["adev", "run", "sapta-web"]).command,
+            Cli::parse_from(["adev", "run", "shop-web"]).command,
             Command::Run {
-                project: "sapta-web".to_string(),
+                project: "shop-web".to_string(),
                 print: false,
             }
         );
         assert_eq!(
-            Cli::parse_from(["adev", "run", "sapta-web", "--print"]).command,
+            Cli::parse_from(["adev", "run", "shop-web", "--print"]).command,
             Command::Run {
-                project: "sapta-web".to_string(),
+                project: "shop-web".to_string(),
                 print: true,
             }
         );
