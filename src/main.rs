@@ -2,7 +2,8 @@
 
 use aether_dev::cli::{Cli, Command};
 use aether_dev::config::Config;
-use aether_dev::domain::Project;
+use aether_dev::docker::{probe_all, DockerClient, HttpDockerClient};
+use aether_dev::domain::{Project, ServiceState, ServiceStatus};
 use aether_dev::git::GitCli;
 use aether_dev::ports::{collect, ProjectScanner};
 use aether_dev::scan::FsProjectScanner;
@@ -11,7 +12,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Prints a line, treating a reader that walked away the way every other
 /// command-line tool does: as a normal end, not a crash. `adev scan | head`
@@ -40,8 +41,8 @@ fn main() -> ExitCode {
 
     match cli.command {
         Command::Scan { json } => scan(&config, json),
-        Command::Services { .. } => not_built_yet("services"),
-        Command::Ports { .. } => not_built_yet("ports"),
+        Command::Services { json } => services(&config, json),
+        Command::Ports { json } => ports(&config, json),
         Command::Db(_) => not_built_yet("db"),
         Command::Domains(_) => not_built_yet("domains"),
         Command::Tui => not_built_yet("tui"),
@@ -141,4 +142,114 @@ fn clip(text: &str, max: usize) -> String {
     } else {
         text.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
     }
+}
+
+/// How long a service port is given to answer before it counts as closed.
+/// Short on purpose: this runs on every refresh, and a stopped service must
+/// not make the whole listing wait.
+const PORT_PROBE: Duration = Duration::from_millis(300);
+
+fn docker_client(config: &Config) -> Result<HttpDockerClient, ExitCode> {
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    HttpDockerClient::new(&config.docker.endpoint, docker_host.as_deref()).map_err(|error| {
+        eprintln!("adev: {error}");
+        ExitCode::from(2)
+    })
+}
+
+fn load_services(config: &Config) -> Result<Vec<ServiceStatus>, ExitCode> {
+    let client = docker_client(config)?;
+    let mut services = client.services().map_err(|error| {
+        eprintln!("adev: {error}");
+        ExitCode::from(2)
+    })?;
+    probe_all(&mut services, PORT_PROBE);
+    services.sort_by(|a, b| a.service.cmp(&b.service));
+    Ok(services)
+}
+
+/// One word for what a service is actually doing. "running" and "usable" are
+/// deliberately not the same word.
+fn condition(service: &ServiceStatus) -> &'static str {
+    match (service.state, service.port_open, service.port.is_some()) {
+        (ServiceState::Stopped, _, _) => "stopped",
+        (ServiceState::Running, true, _) => "ready",
+        (ServiceState::Running, false, true) => "starting",
+        (ServiceState::Running, false, false) => "running",
+    }
+}
+
+fn services(config: &Config, json: bool) -> ExitCode {
+    let services = match load_services(config) {
+        Ok(services) => services,
+        Err(code) => return code,
+    };
+
+    if json {
+        return match serde_json::to_string_pretty(&services) {
+            Ok(text) => {
+                outln!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("adev: could not render JSON: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    for service in &services {
+        outln!(
+            "{:<18} {:<24} {:<7} {}",
+            clip(&service.service, 18),
+            clip(&service.container, 24),
+            service
+                .port
+                .map_or_else(|| "-".to_string(), |p| p.to_string()),
+            condition(service)
+        );
+    }
+    let ready = services.iter().filter(|s| s.is_reachable()).count();
+    outln!("\n{} services, {ready} ready", services.len());
+    ExitCode::SUCCESS
+}
+
+fn ports(config: &Config, json: bool) -> ExitCode {
+    let services = match load_services(config) {
+        Ok(services) => services,
+        Err(code) => return code,
+    };
+    let published: Vec<&ServiceStatus> = services.iter().filter(|s| s.port.is_some()).collect();
+
+    if json {
+        return match serde_json::to_string_pretty(&published) {
+            Ok(text) => {
+                outln!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("adev: could not render JSON: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    for service in &published {
+        outln!(
+            "{:>6}  {:<18} {}",
+            service.port.unwrap_or_default(),
+            clip(&service.service, 18),
+            if service.port_open {
+                "answering"
+            } else {
+                "no answer"
+            }
+        );
+    }
+    let answering = published.iter().filter(|s| s.port_open).count();
+    outln!(
+        "\n{} published ports, {answering} answering",
+        published.len()
+    );
+    ExitCode::SUCCESS
 }
