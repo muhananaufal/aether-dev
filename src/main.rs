@@ -8,9 +8,25 @@ use aether_dev::ports::{collect, ProjectScanner};
 use aether_dev::scan::FsProjectScanner;
 use clap::Parser;
 use serde::Serialize;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
+
+/// Prints a line, treating a reader that walked away the way every other
+/// command-line tool does: as a normal end, not a crash. `adev scan | head`
+/// closes the pipe on purpose, and panicking there looks like a bug in us.
+macro_rules! outln {
+    ($($arg:tt)*) => {
+        if let Err(error) = writeln!(std::io::stdout(), $($arg)*) {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return ExitCode::SUCCESS;
+            }
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
+    };
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -82,7 +98,7 @@ fn scan(config: &Config, json: bool) -> ExitCode {
             elapsed_ms: elapsed.as_millis(),
         };
         match serde_json::to_string_pretty(&report) {
-            Ok(text) => println!("{text}"),
+            Ok(text) => outln!("{text}"),
             Err(error) => {
                 eprintln!("adev: could not render JSON: {error}");
                 return ExitCode::from(2);
@@ -92,7 +108,7 @@ fn scan(config: &Config, json: bool) -> ExitCode {
     }
 
     for project in &outcome.projects {
-        println!(
+        outln!(
             "{:<30} {:<14} {:<9} {:<26} {}",
             clip(&project.name, 30),
             clip(project.category.as_deref().unwrap_or("-"), 14),
@@ -102,7 +118,7 @@ fn scan(config: &Config, json: bool) -> ExitCode {
         );
     }
     for (path, reason) in &outcome.failures {
-        println!("{:<30} {} ({})", "! unreadable", path.display(), reason);
+        outln!("{:<30} {} ({})", "! unreadable", path.display(), reason);
     }
 
     // The denominator is printed on purpose: "no projects" and "nothing was
@@ -110,7 +126,7 @@ fn scan(config: &Config, json: bool) -> ExitCode {
     let examined = outcome
         .scanned
         .map_or_else(|| "?".to_string(), |count| count.to_string());
-    println!(
+    outln!(
         "\n{} projects, {} failures, {examined} directories examined in {:.2}s",
         outcome.projects.len(),
         outcome.failures.len(),
