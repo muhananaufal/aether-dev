@@ -19,7 +19,7 @@ use aether_dev::proxy::DomainSet;
 use aether_dev::recipe;
 use aether_dev::scan::FsProjectScanner;
 use aether_dev::toolchain::{self, Reason, Resolution};
-use aether_dev::tui::{Dashboard, Detail, Notice, Pane, Update};
+use aether_dev::tui::{Dashboard, Detail, MenuItem, Notice, Pane, Update};
 use clap::Parser;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -567,6 +567,68 @@ fn load_dump(
     Ok((container, dump.len()))
 }
 
+/// What can be done to the row the cursor is on, in words.
+///
+/// Every entry carries the key that does the same thing, and choosing one is
+/// the same as pressing that key - so this is a way of finding the actions,
+/// never a second copy of them. Nothing here has to be remembered, and anyone
+/// who would rather stop opening the menu has already been shown how.
+fn menu_for(dashboard: &Dashboard) -> Option<(String, Vec<MenuItem>)> {
+    let mut items = match dashboard.focus() {
+        Pane::Projects => vec![
+            MenuItem::new("run it", 'p'),
+            MenuItem::new("open a shell in it", 't'),
+            MenuItem::new("run one command in it", ':'),
+            MenuItem::new("open its folder", 'e'),
+            MenuItem::new("open it in a browser", 'o'),
+            MenuItem::new("which .env it uses", '.'),
+            MenuItem::new("which toolchain versions", 'v'),
+        ],
+        Pane::Services | Pane::Ports => {
+            let mut actions = vec![
+                MenuItem::new("start it", 's'),
+                MenuItem::new("stop it", 'x'),
+                MenuItem::new("restart it", 'S'),
+                MenuItem::new("read its log", 'l'),
+                MenuItem::new("open it in a browser", 'o'),
+                MenuItem::new("back up all its databases", 'b'),
+                MenuItem::new("dump one database", 'E'),
+                MenuItem::new("load a dump into it", 'I'),
+            ];
+            // Only where there is a process to end, and never near the top: a
+            // menu that puts "kill" under the resting cursor is a trap.
+            if dashboard.selected_port().is_some_and(|l| l.pid.is_some()) {
+                actions.push(MenuItem::new("end what holds this port", 'K'));
+            }
+            actions
+        }
+    };
+
+    let subject = match dashboard.focus() {
+        Pane::Projects => dashboard.selected_project()?.name.clone(),
+        Pane::Services => dashboard.selected_service()?.service.clone(),
+        Pane::Ports => {
+            let listener = dashboard.selected_port()?;
+            match dashboard.selected_service() {
+                Some(service) => format!("{} · {}", listener.port, service.service),
+                None => format!(
+                    "{} · {}",
+                    listener.port,
+                    listener.process.as_deref().unwrap_or("unknown")
+                ),
+            }
+        }
+    };
+
+    items.extend([
+        MenuItem::new("routed hostnames", 'd'),
+        MenuItem::new("refresh this pane", 'r'),
+        MenuItem::new("settings", 'g'),
+        MenuItem::new("every key", '?'),
+    ]);
+    Some((subject, items))
+}
+
 /// An action held back until the user says yes.
 ///
 /// Only for what cannot be undone. Everything else in the dashboard - start,
@@ -1089,7 +1151,43 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                 continue;
             }
 
-            match key.code {
+            // The menu is a way of finding the keys, not a second path to the
+            // actions: choosing an entry becomes the keystroke it names, and
+            // falls through to exactly the same handling below.
+            let mut code = key.code;
+            if dashboard.menu_open() {
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        dashboard.close_menu();
+                        continue;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        dashboard.menu_move(1);
+                        continue;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        dashboard.menu_move(-1);
+                        continue;
+                    }
+                    KeyCode::Enter => match dashboard.take_menu_choice() {
+                        Some(chosen) => code = KeyCode::Char(chosen),
+                        None => continue,
+                    },
+                    // Anything else while a menu is open is a slip, not a
+                    // command meant for the screen behind it.
+                    _ => continue,
+                }
+            }
+
+            match code {
+                // Everything the selected row can do, in words. This is the
+                // way in for anybody who would rather not memorise anything.
+                KeyCode::Enter => match menu_for(&dashboard) {
+                    Some((subject, items)) => dashboard.open_menu(subject, items),
+                    None => dashboard.apply(Update::Notice(Notice::failed(
+                        "nothing is selected here yet",
+                    ))),
+                },
                 KeyCode::Char('?') => dashboard.toggle_help(),
                 KeyCode::Char('g') => dashboard.toggle_settings(),
                 KeyCode::Char('l') => match dashboard.selected_service() {
@@ -1339,10 +1437,10 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
 
                 // Anything that wants the terminal gets it, once the dashboard
                 // has handed it back. Fighting over stdout would garble both.
-                KeyCode::Enter => match dashboard.selected_project() {
+                KeyCode::Char('p') => match dashboard.selected_project() {
                     Some(project) => break Ok(Leave::Run(project.name.clone())),
                     None => dashboard.apply(Update::Notice(Notice::failed(
-                        "enter starts a project — move to the projects pane first",
+                        "p starts a project — move to the projects pane first",
                     ))),
                 },
                 KeyCode::Char('t') => match dashboard.selected_project() {
