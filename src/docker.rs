@@ -218,6 +218,9 @@ impl DockerClient for HttpDockerClient {
 pub struct ContainerDetail {
     pub image: String,
     pub env: Vec<String>,
+    /// A container started with a terminal writes one unframed stream instead
+    /// of the multiplexed pair, so the reader has to know which to expect.
+    pub tty: bool,
 }
 
 #[derive(Deserialize)]
@@ -232,6 +235,8 @@ struct ApiInspectConfig {
     image: String,
     #[serde(rename = "Env", default)]
     env: Vec<String>,
+    #[serde(rename = "Tty", default)]
+    tty: bool,
 }
 
 pub fn parse_inspect(json: &str) -> Result<ContainerDetail, DockerError> {
@@ -240,6 +245,7 @@ pub fn parse_inspect(json: &str) -> Result<ContainerDetail, DockerError> {
     Ok(ContainerDetail {
         image: raw.config.image,
         env: raw.config.env,
+        tty: raw.config.tty,
     })
 }
 
@@ -283,6 +289,32 @@ pub fn demux_into(source: &mut impl Read, stdout: &mut impl Write) -> std::io::R
         } else {
             stdout.write_all(&payload)?;
         }
+    }
+}
+
+/// Writes both multiplexed streams to one place, in the order they arrived.
+///
+/// Unlike an exec, where stdout is the result and stderr is commentary, a log
+/// is a conversation between the two: separating them loses which line came
+/// first, which is usually the thing being looked for.
+pub fn demux_merged(source: &mut impl Read, out: &mut impl Write) -> std::io::Result<()> {
+    let mut header = [0u8; 8];
+    loop {
+        if !read_exactly(source, &mut header)? {
+            return Ok(());
+        }
+        let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        if length == 0 {
+            continue;
+        }
+        let mut payload = vec![0u8; length];
+        if !read_exactly(source, &mut payload)? {
+            return Ok(());
+        }
+        out.write_all(&payload)?;
+        // Flushed per frame so following a log shows lines as they land rather
+        // than in bursts when a buffer happens to fill.
+        out.flush()?;
     }
 }
 
@@ -362,6 +394,36 @@ impl HttpDockerClient {
             .send(archive)
             .map_err(|error| self.unreachable(error.to_string()))?;
         Ok(())
+    }
+
+    /// Streams a container's log output. `framed` comes from the container's
+    /// own Tty setting: with a terminal attached the daemon sends one raw
+    /// stream, without one it sends the multiplexed pair.
+    pub fn logs(
+        &self,
+        container: &str,
+        follow: bool,
+        tail: Option<u32>,
+        framed: bool,
+        out: &mut impl Write,
+    ) -> Result<(), DockerError> {
+        let tail = tail.map_or_else(|| "all".to_string(), |lines| lines.to_string());
+        let url = format!(
+            "{}/containers/{container}/logs?stdout=1&stderr=1&tail={tail}&follow={}",
+            self.base,
+            u8::from(follow)
+        );
+        let mut response = ureq::get(&url)
+            .call()
+            .map_err(|error| self.unreachable(error.to_string()))?;
+        let mut reader = response.body_mut().as_reader();
+
+        let outcome = if framed {
+            demux_merged(&mut reader, out)
+        } else {
+            std::io::copy(&mut reader, out).map(|_| ())
+        };
+        outcome.map_err(|error| self.unreachable(error.to_string()))
     }
 
     pub fn inspect(&self, container: &str) -> Result<ContainerDetail, DockerError> {
@@ -693,6 +755,32 @@ mod tests {
             base_url("tcp://localhostings:2375", None).unwrap(),
             "http://localhostings:2375",
             "only the name localhost itself is redirected, not anything containing it"
+        );
+    }
+
+    #[test]
+    fn inspecting_reports_whether_the_container_has_a_terminal_attached() {
+        let with_tty = parse_inspect(r#"{"Config":{"Image":"x","Tty":true}}"#).unwrap();
+        let without = parse_inspect(REAL_INSPECT).unwrap();
+        assert!(
+            with_tty.tty && !without.tty,
+            "a container with a terminal sends its output unframed, so the reader \
+             has to know which shape to expect"
+        );
+    }
+
+    #[test]
+    fn merged_output_keeps_the_two_streams_in_the_order_they_arrived() {
+        let mut wire = frame(1, b"starting\n");
+        wire.extend(frame(2, b"warning: no config\n"));
+        wire.extend(frame(1, b"ready\n"));
+
+        let mut out = Vec::new();
+        demux_merged(&mut std::io::Cursor::new(wire), &mut out).unwrap();
+        assert_eq!(
+            out, b"starting\nwarning: no config\nready\n",
+            "a log is a conversation between the two streams; separating them loses \
+             which line came first"
         );
     }
 }

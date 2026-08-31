@@ -54,6 +54,11 @@ fn main() -> ExitCode {
         Command::Ports { json } => ports(&config, json),
         Command::Db(command) => db(&config, command),
         Command::Domains(command) => domains(&config, command),
+        Command::Logs {
+            service,
+            follow,
+            tail,
+        } => logs(&config, &service, follow, tail),
         Command::Tui => tui(&config),
     }
 }
@@ -733,4 +738,40 @@ fn import(config: &Config, service: &str, database: &str, file: &Path) -> ExitCo
         started.elapsed().as_secs_f64()
     );
     ExitCode::SUCCESS
+}
+
+fn logs(config: &Config, service: &str, follow: bool, tail: Option<u32>) -> ExitCode {
+    let client = match docker_client(config) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let container = match container_for(&client, service) {
+        Ok(container) => container,
+        Err(code) => return code,
+    };
+    // Asked rather than guessed: whether the output is framed depends on how
+    // the container was started, and reading the wrong shape turns a log into
+    // a screen of control bytes.
+    let framed = match client.inspect(&container) {
+        Ok(detail) => !detail.tty,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match client.logs(&container, follow, tail, framed, &mut out) {
+        Ok(()) => ExitCode::SUCCESS,
+        // Piping into head closes the stream on purpose; so does interrupting
+        // a follow. Neither is a failure of ours.
+        Err(DockerError::Unreachable { reason, .. }) if reason.contains("pipe") => {
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("adev: {error}");
+            ExitCode::from(2)
+        }
+    }
 }

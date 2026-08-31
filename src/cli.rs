@@ -47,6 +47,17 @@ pub enum Command {
     /// Manage the local reverse-proxy hostnames.
     #[command(subcommand)]
     Domains(DomainCommand),
+    /// Follow what a service is writing.
+    Logs {
+        /// Service or container to read.
+        service: String,
+        /// Keep the stream open and print new lines as they arrive.
+        #[arg(long, short)]
+        follow: bool,
+        /// Start this many lines back instead of at the beginning.
+        #[arg(long, short)]
+        tail: Option<u32>,
+    },
     /// Open the interactive dashboard.
     Tui,
 }
@@ -285,5 +296,25 @@ mod tests {
             forced.command,
             Command::Db(DbCommand::Export { force: true, .. })
         ));
+    }
+
+    #[test]
+    fn logs_name_a_service_and_can_follow_or_limit_how_far_back_they_start() {
+        assert_eq!(
+            Cli::parse_from(["adev", "logs", "mysql"]).command,
+            Command::Logs {
+                service: "mysql".to_string(),
+                follow: false,
+                tail: None,
+            }
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "logs", "mysql", "--follow", "--tail", "50"]).command,
+            Command::Logs {
+                service: "mysql".to_string(),
+                follow: true,
+                tail: Some(50),
+            }
+        );
     }
 }
