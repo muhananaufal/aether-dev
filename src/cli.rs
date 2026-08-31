@@ -58,18 +58,30 @@ pub enum Command {
     /// that has never been created has no container to start, and is reported
     /// as such rather than silently skipped.
     Start {
-        #[arg(required = true)]
+        #[arg(required_unless_present = "all")]
         services: Vec<String>,
+        /// Every service that has a container, rather than naming them.
+        #[arg(long)]
+        all: bool,
     },
     /// Stop running services, leaving their containers in place.
     Stop {
-        #[arg(required = true)]
+        #[arg(required_unless_present = "all")]
         services: Vec<String>,
+        #[arg(long)]
+        all: bool,
     },
     /// Restart services.
     Restart {
-        #[arg(required = true)]
+        #[arg(required_unless_present = "all")]
         services: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Open a service or a project in a browser.
+    Open {
+        /// A service name, or a project name — services are looked at first.
+        target: String,
     },
     /// End whatever is holding a port.
     Kill {
@@ -392,19 +404,22 @@ mod tests {
         assert_eq!(
             Cli::parse_from(["adev", "start", "mysql", "postgres"]).command,
             Command::Start {
-                services: vec!["mysql".to_string(), "postgres".to_string()]
+                services: vec!["mysql".to_string(), "postgres".to_string()],
+                all: false,
             }
         );
         assert_eq!(
             Cli::parse_from(["adev", "stop", "mysql"]).command,
             Command::Stop {
-                services: vec!["mysql".to_string()]
+                services: vec!["mysql".to_string()],
+                all: false,
             }
         );
         assert_eq!(
             Cli::parse_from(["adev", "restart", "caddy"]).command,
             Command::Restart {
-                services: vec!["caddy".to_string()]
+                services: vec!["caddy".to_string()],
+                all: false,
             }
         );
     }
@@ -547,5 +562,38 @@ mod tests {
             Cli::try_parse_from(["adev", "kill", "not-a-port"]).is_err(),
             "a port is a number, and refusing early beats failing later"
         );
+    }
+
+    #[test]
+    fn every_service_can_be_acted_on_at_once_but_only_when_asked() {
+        assert_eq!(
+            Cli::parse_from(["adev", "stop", "--all"]).command,
+            Command::Stop {
+                services: vec![],
+                all: true,
+            }
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "start", "mysql"]).command,
+            Command::Start {
+                services: vec!["mysql".to_string()],
+                all: false,
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["adev", "stop"]).is_err(),
+            "stopping everything because nothing was named is not a plausible intent"
+        );
+    }
+
+    #[test]
+    fn opening_something_in_a_browser_names_what_to_open() {
+        assert_eq!(
+            Cli::parse_from(["adev", "open", "dbgate"]).command,
+            Command::Open {
+                target: "dbgate".to_string()
+            }
+        );
+        assert!(Cli::try_parse_from(["adev", "open"]).is_err());
     }
 }

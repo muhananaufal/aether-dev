@@ -72,11 +72,12 @@ fn main() -> ExitCode {
         Command::Services { json, memory } => services(&config, json, memory),
         Command::Ports { json } => ports(&config, json),
         Command::Kill { port, dry_run } => kill(port, dry_run),
+        Command::Open { target } => open(&config, &target),
         Command::Db(command) => db(&config, command),
         Command::Domains(command) => domains(&config, command),
-        Command::Start { services } => lifecycle(&config, &services, Action::Start),
-        Command::Stop { services } => lifecycle(&config, &services, Action::Stop),
-        Command::Restart { services } => lifecycle(&config, &services, Action::Restart),
+        Command::Start { services, all } => lifecycle(&config, &services, all, Action::Start),
+        Command::Stop { services, all } => lifecycle(&config, &services, all, Action::Stop),
+        Command::Restart { services, all } => lifecycle(&config, &services, all, Action::Restart),
         Command::Logs {
             service,
             follow,
@@ -932,7 +933,7 @@ impl Action {
     }
 }
 
-fn lifecycle(config: &Config, names: &[String], action: Action) -> ExitCode {
+fn lifecycle(config: &Config, names: &[String], all: bool, action: Action) -> ExitCode {
     let client = match docker_client(config) {
         Ok(client) => client,
         Err(code) => return code,
@@ -945,8 +946,16 @@ fn lifecycle(config: &Config, names: &[String], action: Action) -> ExitCode {
         }
     };
 
+    // --all means every container there is, so the names are taken from what
+    // docker reports rather than from the command line.
+    let chosen: Vec<String> = if all {
+        services.iter().map(|s| s.service.clone()).collect()
+    } else {
+        names.to_vec()
+    };
+
     let mut refused = false;
-    for name in names {
+    for name in &chosen {
         let found = services
             .iter()
             .find(|candidate| candidate.service == *name || candidate.container == *name);
@@ -1549,4 +1558,53 @@ fn open_in_browser(url: &str) -> std::io::Result<()> {
     };
 
     command.spawn().map(|_| ())
+}
+
+/// Opens a service or a project in a browser.
+///
+/// Services are looked at first because they are the shorter, more definite
+/// list; a project only has an address if something knows how it starts.
+fn open(config: &Config, target: &str) -> ExitCode {
+    if let Ok(services) = load_services(config, false) {
+        if let Some(service) = services
+            .iter()
+            .find(|s| s.service == target || s.container == target)
+        {
+            return match service.port {
+                Some(port) => open_url(&format!("http://localhost:{port}")),
+                None => {
+                    eprintln!("adev: {target} publishes no port to open");
+                    ExitCode::from(2)
+                }
+            };
+        }
+    }
+
+    let (name, path) = match locate_project(config, target) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    let entries = entries_in(&path);
+    let present: Vec<&str> = entries.iter().map(String::as_str).collect();
+    match recipe::plan_for(&name, &present, &config.recipe, &config.run).and_then(|plan| plan.port)
+    {
+        Some(port) => open_url(&format!("http://localhost:{port}")),
+        None => {
+            eprintln!("adev: nothing here says which address {name} would serve on");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn open_url(url: &str) -> ExitCode {
+    match open_in_browser(url) {
+        Ok(()) => {
+            outln!("opened {url}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("adev: cannot open {url}: {error}");
+            ExitCode::from(2)
+        }
+    }
 }
