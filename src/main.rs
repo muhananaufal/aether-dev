@@ -1557,6 +1557,8 @@ fn toolchains_for(config: &Config, name: &str, path: &Path) -> Vec<(String, Reso
     let read = |file: &str| std::fs::read_to_string(path.join(file)).ok();
     let composer = read("composer.json");
     let package = read("package.json");
+    let entries = entries_in(path);
+    let present: Vec<&str> = entries.iter().map(String::as_str).collect();
 
     let mut resolved = Vec::new();
     for (tool, settings) in &config.toolchain {
@@ -1564,15 +1566,15 @@ fn toolchains_for(config: &Config, name: &str, path: &Path) -> Vec<(String, Reso
         let declared = match tool.as_str() {
             "php" => composer.as_deref().and_then(toolchain::wanted_php),
             "node" => package.as_deref().and_then(toolchain::wanted_node),
+            // Nothing else has a manifest this reads a version out of yet, so
+            // the choice falls to a pin or to the newest installed.
             _ => None,
         };
-        let relevant = pinned.is_some()
-            || match tool.as_str() {
-                "php" => composer.is_some(),
-                "node" => package.is_some(),
-                _ => false,
-            };
-        if !relevant {
+        // A pin is a decision already made, so it applies whatever the project
+        // holds. Otherwise the tool's own `when` decides, which is how a Go or
+        // Python toolchain becomes relevant without this code having to know
+        // the language exists.
+        if pinned.is_none() && !toolchain::applies_named(tool, settings, &present) {
             continue;
         }
 
