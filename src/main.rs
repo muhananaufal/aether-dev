@@ -2240,6 +2240,44 @@ fn settings(
     outln!("  container   {}", config.caddy.container);
     outln!("  caddyfile   {}", config.caddy.caddyfile.display());
     outln!("  domains     {}", config.caddy.domains.display());
+    outln!("[open]");
+    outln!("  browser     {}", config.open.browser.join(" "));
+    outln!("  file_manager {}", config.open.file_manager.join(" "));
+    outln!("[backup]");
+    outln!("  directory   {}", config.backup.directory.display());
+    outln!("  gzip        {}", config.backup.gzip);
+    outln!("[memory]");
+    outln!("  interval    {}s", config.memory.interval_secs);
+    outln!("  guest       {}", config.memory.guest.join(" "));
+    outln!("  host_process {}", config.memory.host_process.join(", "));
+
+    if config.service.is_empty() {
+        outln!("\n[service]  none declared — the list is whatever docker reports");
+    } else {
+        for (name, settings) in config.services_declared() {
+            outln!("\n[service.{name}]");
+            outln!("  container   {}", settings.container_for(&name));
+            if let Some(port) = settings.port {
+                outln!("  port        {port}");
+            }
+            if let Some(domain) = &settings.domain {
+                outln!("  domain      {domain}");
+            }
+            if let Some(panel) = &settings.panel {
+                outln!("  panel       {panel}");
+            }
+            if let Some(user) = &settings.user {
+                outln!("  user        {user}");
+            }
+            // Which variable, never what is in it: this output gets pasted
+            // into bug reports.
+            if let Some(variable) = &settings.password_env {
+                outln!("  password    read from {variable}");
+            } else if settings.password.is_some() {
+                outln!("  password    set in this file");
+            }
+        }
+    }
 
     if config.toolchain.is_empty() {
         outln!("\n[toolchain]  nothing configured — adev config --init finds what is here");
@@ -2293,6 +2331,35 @@ fn settings_lines(config: &Config, chosen: Option<&Path>) -> Vec<(String, String
         "caddy.container".to_string(),
         config.caddy.container.clone(),
     ));
+    lines.push((
+        "backup.directory".to_string(),
+        config.backup.directory.display().to_string(),
+    ));
+    lines.push(("open.browser".to_string(), config.open.browser.join(" ")));
+    lines.push((
+        "open.file_manager".to_string(),
+        config.open.file_manager.join(" "),
+    ));
+
+    // What is declared, not what docker happens to be running: this screen
+    // answers "what did I configure", and the services pane answers the rest.
+    if config.service.is_empty() {
+        lines.push((
+            "service".to_string(),
+            "none declared — the list is whatever docker reports".to_string(),
+        ));
+    } else {
+        for (name, settings) in config.services_declared() {
+            let mut parts = vec![settings.container_for(&name)];
+            if let Some(port) = settings.port {
+                parts.push(format!("port {port}"));
+            }
+            if let Some(domain) = &settings.domain {
+                parts.push(domain.clone());
+            }
+            lines.push((format!("service.{name}"), parts.join(" · ")));
+        }
+    }
 
     if config.toolchain.is_empty() {
         lines.push((
