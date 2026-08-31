@@ -143,11 +143,17 @@ impl Dashboard {
                 .iter()
                 .map(|project| {
                     format!(
-                        "{:<28} {:<12} {:<9} {:<22} {}",
+                        "{:<28} {:<12} {:<18} {:<20} {}",
                         clip(&project.name, 28),
                         clip(project.category.as_deref().unwrap_or("-"), 12),
-                        format!("{:?}", project.stack),
-                        clip(project.git.branch.as_deref().unwrap_or("-"), 22),
+                        clip(
+                            &project
+                                .framework
+                                .clone()
+                                .unwrap_or_else(|| format!("{:?}", project.stack)),
+                            18,
+                        ),
+                        clip(project.git.branch.as_deref().unwrap_or("-"), 20),
                         project.git.badge()
                     )
                 })
@@ -286,6 +292,7 @@ mod tests {
             category: Some("group".to_string()),
             path: PathBuf::from(name),
             stack: Stack::Rust,
+            framework: None,
             git: GitStatus::clean("main"),
         }
     }

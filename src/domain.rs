@@ -91,6 +91,9 @@ pub struct Project {
     pub category: Option<String>,
     pub path: PathBuf,
     pub stack: Stack,
+    /// The framework and version this project is built on, when it says.
+    /// `None` means the project did not say, not that it has none.
+    pub framework: Option<String>,
     pub git: GitStatus,
 }
 

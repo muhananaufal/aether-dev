@@ -10,6 +10,7 @@ pub mod config;
 pub mod db;
 pub mod docker;
 pub mod domain;
+pub mod framework;
 pub mod git;
 pub mod ports;
 pub mod proxy;

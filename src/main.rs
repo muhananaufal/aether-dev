@@ -117,11 +117,17 @@ fn scan(config: &Config, json: bool) -> ExitCode {
 
     for project in &outcome.projects {
         outln!(
-            "{:<30} {:<14} {:<9} {:<26} {}",
+            "{:<30} {:<14} {:<18} {:<22} {}",
             clip(&project.name, 30),
             clip(project.category.as_deref().unwrap_or("-"), 14),
-            format!("{:?}", project.stack),
-            clip(project.git.branch.as_deref().unwrap_or("-"), 26),
+            clip(
+                &project
+                    .framework
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?}", project.stack)),
+                18,
+            ),
+            clip(project.git.branch.as_deref().unwrap_or("-"), 22),
             project.git.badge()
         );
     }

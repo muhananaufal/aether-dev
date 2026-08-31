@@ -70,6 +70,7 @@ mod tests {
             name: name.to_string(),
             category: None,
             path: PathBuf::from(name),
+            framework: None,
             stack: Stack::Rust,
             git: GitStatus::clean("main"),
         }

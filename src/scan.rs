@@ -6,6 +6,7 @@
 
 use crate::config::ProjectConfig;
 use crate::domain::{Project, Stack};
+use crate::framework;
 use crate::git::GitReader;
 use crate::ports::{ProjectScanner, ScanEvent};
 use std::collections::VecDeque;
@@ -74,6 +75,7 @@ impl<G: GitReader + 'static> ProjectScanner for FsProjectScanner<G> {
                     Ok(status) => ScanEvent::Found(Project {
                         name: candidate.name,
                         category: candidate.category,
+                        framework: read_framework(&candidate.path),
                         path: candidate.path,
                         stack: candidate.stack,
                         git: status,
@@ -153,6 +155,33 @@ fn markers_in(dir: &Path) -> Vec<String> {
         .filter(|marker| dir.join(marker).is_file())
         .map(|marker| (*marker).to_string())
         .collect()
+}
+
+/// Reads whichever manifests a project happens to have and names its
+/// framework. Runs inside the worker pool alongside the git call, because it
+/// is file reading and belongs with the other slow part rather than in the
+/// sequential walk.
+fn read_framework(path: &Path) -> Option<String> {
+    let at = |relative: &str| std::fs::read_to_string(path.join(relative)).ok();
+
+    let composer_json = at("composer.json");
+    let laravel_application_php = composer_json
+        .is_some()
+        .then(|| at("vendor/laravel/framework/src/Illuminate/Foundation/Application.php"))
+        .flatten();
+    let package_json = at("package.json");
+    let codeigniter_php = at("system/core/CodeIgniter.php");
+    let go_mod = at("go.mod");
+    let cargo_toml = at("Cargo.toml");
+
+    framework::detect(&framework::Manifests {
+        composer_json: composer_json.as_deref(),
+        laravel_application_php: laravel_application_php.as_deref(),
+        package_json: package_json.as_deref(),
+        codeigniter_php: codeigniter_php.as_deref(),
+        go_mod: go_mod.as_deref(),
+        cargo_toml: cargo_toml.as_deref(),
+    })
 }
 
 #[cfg(test)]
