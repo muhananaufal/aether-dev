@@ -101,6 +101,10 @@ pub struct Project {
 pub enum ServiceState {
     Running,
     Stopped,
+    /// Declared in the configuration, but no container exists for it. Docker
+    /// cannot report this state because docker does not know the service was
+    /// ever meant to exist; only the configuration does.
+    Absent,
 }
 
 /// One container from the compose file, as last observed.
@@ -128,6 +132,7 @@ impl ServiceStatus {
     /// was still refusing connections.
     pub fn condition(&self) -> &'static str {
         match (self.state, self.port_open, self.port.is_some()) {
+            (ServiceState::Absent, _, _) => "absent",
             (ServiceState::Stopped, _, _) => "stopped",
             (ServiceState::Running, true, _) => "ready",
             (ServiceState::Running, false, true) => "starting",
@@ -267,5 +272,23 @@ mod tests {
             .condition(),
             "stopped"
         );
+    }
+
+    #[test]
+    fn a_declared_service_with_no_container_reads_as_absent() {
+        let declared = ServiceStatus {
+            container: "mongo-db".to_string(),
+            service: "mongodb".to_string(),
+            port: Some(27017),
+            state: ServiceState::Absent,
+            port_open: false,
+            memory_bytes: None,
+        };
+        assert_eq!(
+            declared.condition(),
+            "absent",
+            "never created is a different problem from stopped, and needs a different fix"
+        );
+        assert!(!declared.is_reachable());
     }
 }

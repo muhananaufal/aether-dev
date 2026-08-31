@@ -1,13 +1,18 @@
 //! The `adev` command.
 
+use aether_dev::catalog;
 use aether_dev::cli::{Cli, Command, DbCommand, DomainCommand};
 use aether_dev::config::{self, Config};
-use aether_dev::db::{backup_filename, dump_all_plan, dump_plan, restore_plan, Engine, ExecPlan};
+use aether_dev::db::{
+    backup_filename, dump_all_plan, dump_plan, restore_plan, Account, Engine, ExecPlan,
+};
 use aether_dev::docker::{probe_all, DockerClient, DockerError, HttpDockerClient};
 use aether_dev::domain::{Project, ServiceState, ServiceStatus};
 use aether_dev::dotenv;
 use aether_dev::git::GitCli;
 use aether_dev::listen;
+use aether_dev::memory;
+use aether_dev::open;
 use aether_dev::ports::ScanEvent;
 use aether_dev::ports::{collect, ProjectScanner};
 use aether_dev::proxy::DomainSet;
@@ -210,15 +215,15 @@ fn docker_client(config: &Config) -> Result<HttpDockerClient, ExitCode> {
 
 fn load_services(config: &Config, memory: bool) -> Result<Vec<ServiceStatus>, ExitCode> {
     let client = docker_client(config)?;
-    let mut services = client.services().map_err(|error| {
+    let observed = client.services().map_err(|error| {
         eprintln!("adev: {error}");
         ExitCode::from(2)
     })?;
+    let mut services = catalog::merge(&config.services_declared(), &observed);
     probe_all(&mut services, PORT_PROBE);
     if memory {
         fill_memory(&client, &mut services);
     }
-    services.sort_by(|a, b| a.service.cmp(&b.service));
     Ok(services)
 }
 
@@ -261,6 +266,19 @@ fn services(config: &Config, json: bool, memory: bool) -> ExitCode {
     }
     let ready = services.iter().filter(|s| s.is_reachable()).count();
     outln!("\n{} services, {ready} ready", services.len());
+
+    // The same two numbers the dashboard keeps in its footer. Asked for with
+    // --memory, because both probes shell out and nobody wants that on a
+    // command they run in a loop.
+    if memory {
+        let reading = memory::read(&config.memory);
+        if let Some(bytes) = reading.guest_bytes {
+            outln!("{} in use where the containers run", megabytes(Some(bytes)));
+        }
+        if let Some((process, bytes)) = reading.host {
+            outln!("{} of this machine, as {process}", megabytes(Some(bytes)));
+        }
+    }
     ExitCode::SUCCESS
 }
 
@@ -384,6 +402,15 @@ fn kill(port: u16, dry_run: bool) -> ExitCode {
 /// waits: results reach the dashboard as messages, which is the arrangement
 /// that keeps the screen answering while work is still running.
 fn spawn_collectors(config: &Config, updates: Sender<Update>) {
+    spawn_project_collector(config, updates.clone());
+    spawn_service_collector(config, updates);
+}
+
+/// Rescans the project roots. Separate from the services because a rescan of a
+/// few dozen repositories is the slowest thing the dashboard does, and asking
+/// for it every time somebody wants to see whether a container came back up
+/// would make the quick answer wait on the slow one.
+fn spawn_project_collector(config: &Config, updates: Sender<Update>) {
     let project_config = config.project.clone();
     let workers = config.scan.workers;
     let git_timeout = config.scan.git_timeout_ms;
@@ -403,16 +430,21 @@ fn spawn_collectors(config: &Config, updates: Sender<Update>) {
             }
         }
     });
+}
 
+/// Asks docker what it has, and merges it with what the configuration says
+/// this machine is meant to have.
+fn spawn_service_collector(config: &Config, updates: Sender<Update>) {
     let endpoint = config.docker.endpoint.clone();
     let docker_host = std::env::var("DOCKER_HOST").ok();
+    let declared = config.services_declared();
     std::thread::spawn(move || {
         let outcome = HttpDockerClient::new(&endpoint, docker_host.as_deref())
             .and_then(|client| client.services());
         let update = match outcome {
-            Ok(mut services) => {
+            Ok(observed) => {
+                let mut services = catalog::merge(&declared, &observed);
                 probe_all(&mut services, PORT_PROBE);
-                services.sort_by(|a, b| a.service.cmp(&b.service));
                 Update::Services(services)
             }
             Err(error) => Update::ServicesFailed(error.to_string()),
@@ -421,10 +453,71 @@ fn spawn_collectors(config: &Config, updates: Sender<Update>) {
     });
 }
 
+/// Dumps one service's databases for the dashboard, off the draw loop.
+fn spawn_backup(config: &Config, service: ServiceStatus, updates: Sender<Update>) {
+    let endpoint = config.docker.endpoint.clone();
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    let directory = config.backup.directory.join(backup_directory_name());
+    let gzip = config.backup.gzip;
+    // The account lookup reads the configuration, which does not cross to the
+    // thread, so it happens here.
+    let owned = config.clone();
+
+    std::thread::spawn(move || {
+        let notice = match HttpDockerClient::new(&endpoint, docker_host.as_deref()) {
+            Err(error) => Notice::failed(error.to_string()),
+            Ok(client) => match std::fs::create_dir_all(&directory) {
+                Err(error) => {
+                    Notice::failed(format!("cannot create {}: {error}", directory.display()))
+                }
+                Ok(()) => match dump_service(&client, &owned, &service, &directory, gzip) {
+                    Ok(Dumped::Nothing(reason)) => {
+                        Notice::failed(format!("nothing dumped: {reason}"))
+                    }
+                    Ok(Dumped::Written { path, bytes, .. }) => {
+                        Notice::done(format!("{} bytes to {}", bytes, path.display()))
+                    }
+                    Err(reason) => Notice::failed(reason),
+                },
+            },
+        };
+        let _ = updates.send(Update::Notice(notice));
+    });
+}
+
+/// Re-reads what the container host costs, on its own timer.
+///
+/// The probes shell out and can be slow, so they get a thread rather than a
+/// place in the draw loop. It ends when the dashboard drops the receiving end,
+/// which is how every other collector here stops too.
+fn spawn_memory_poller(config: &Config, updates: Sender<Update>) {
+    let settings = config.memory.clone();
+    if settings.interval_secs == 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        let interval = Duration::from_secs(settings.interval_secs);
+        loop {
+            let reading = memory::read(&settings);
+            // A reading with nothing in it means neither probe applies to this
+            // machine. Polling on would spend a process every few seconds to
+            // learn the same thing again.
+            if reading.is_empty() {
+                break;
+            }
+            if updates.send(Update::Memory(reading)).is_err() {
+                break;
+            }
+            std::thread::sleep(interval);
+        }
+    });
+}
+
 fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
     let mut dashboard = Dashboard::new();
     let (updates, incoming) = mpsc::channel();
     spawn_collectors(config, updates.clone());
+    spawn_memory_poller(config, updates.clone());
     // Held so closing the view can unwind the reader, which is otherwise
     // blocked waiting for a line that may never come.
     let mut watching: Option<Arc<AtomicBool>> = None;
@@ -502,8 +595,23 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                 KeyCode::PageUp => dashboard.move_selection(-10),
                 // The new collectors report into the same channel the loop is
                 // already draining, so their results land like any other.
-                KeyCode::Char('r') => {
+                // Refresh what you are looking at. Rescanning every repository
+                // to find out whether a container restarted is a wait nobody
+                // asked for, so the focused pane decides what is redone.
+                KeyCode::Char('r') => match dashboard.focus() {
+                    Pane::Projects => {
+                        dashboard.begin_refresh();
+                        dashboard.apply(Update::Notice(Notice::working("rescanning projects")));
+                        spawn_project_collector(config, updates.clone());
+                    }
+                    Pane::Services | Pane::Ports => {
+                        dashboard.apply(Update::Notice(Notice::working("rereading services")));
+                        spawn_service_collector(config, updates.clone());
+                    }
+                },
+                KeyCode::Char('R') => {
                     dashboard.begin_refresh();
+                    dashboard.apply(Update::Notice(Notice::working("refreshing everything")));
                     spawn_collectors(config, updates.clone());
                 }
 
@@ -529,16 +637,54 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                 }
 
                 KeyCode::Char('o') => {
-                    let url = dashboard
-                        .selected_service()
-                        .and_then(|service| service.port)
-                        .map(|port| format!("http://localhost:{port}"));
+                    // A service can name the page worth opening. A port with no
+                    // page behind it is still better than nothing, so it stays
+                    // as the fallback.
+                    let url = dashboard.selected_service().and_then(|service| {
+                        panel_for(config, &service.service)
+                            .or_else(|| service.port.map(|port| format!("http://localhost:{port}")))
+                    });
                     let notice = match url {
-                        Some(url) => match open_in_browser(&url) {
+                        Some(url) => match spawn_opener(&config.open.browser, &url) {
                             Ok(()) => Notice::done(format!("opened {url}")),
                             Err(error) => Notice::failed(format!("{url}: {error}")),
                         },
-                        None => Notice::failed("nothing here publishes a port to open"),
+                        None => Notice::failed("nothing here publishes a port or a page to open"),
+                    };
+                    dashboard.apply(Update::Notice(notice));
+                }
+
+                // Dumping every database on a service needs no arguments, so it
+                // is the one database job the dashboard can do without asking
+                // anything. It runs on a thread: a large database takes long
+                // enough that doing it here would freeze the screen.
+                KeyCode::Char('b') => match dashboard.selected_service().cloned() {
+                    Some(service) => {
+                        dashboard.apply(Update::Notice(Notice::working(format!(
+                            "backing up {}",
+                            service.service
+                        ))));
+                        spawn_backup(config, service, updates.clone());
+                    }
+                    None => dashboard.apply(Update::Notice(Notice::failed(
+                        "b backs up a service — move to the services or ports pane first",
+                    ))),
+                },
+
+                // The project's directory, in whatever this machine uses to
+                // look at directories.
+                KeyCode::Char('e') => {
+                    let notice = match dashboard.selected_project() {
+                        Some(project) => {
+                            let path = project.path.display().to_string();
+                            match spawn_opener(&config.open.file_manager, &path) {
+                                Ok(()) => Notice::done(format!("opened {path}")),
+                                Err(error) => Notice::failed(format!("{path}: {error}")),
+                            }
+                        }
+                        None => Notice::failed(
+                            "e opens a project's folder — move to the projects pane first",
+                        ),
                     };
                     dashboard.apply(Update::Notice(notice));
                 }
@@ -592,7 +738,39 @@ fn load_domains(path: &Path) -> Result<DomainSet, ExitCode> {
 /// Writes the source of truth first, then the file generated from it. In that
 /// order a crash in between leaves the record of intent intact and the proxy
 /// serving what it served before, rather than the other way round.
+/// Every route the proxy should serve: the ones in the domains file, plus the
+/// ones the declared services ask for.
+///
+/// The two are merged here rather than in the file, so a service's hostname
+/// stays a fact about that service instead of being copied into an artefact
+/// that would then disagree with it. A host claimed by both is refused, which
+/// is the same answer the file gives when it names one host twice.
+fn all_routes(config: &Config, set: &DomainSet) -> Result<DomainSet, ExitCode> {
+    let declared = catalog::service_domains(&config.services_declared()).map_err(|error| {
+        eprintln!("adev: {error}");
+        ExitCode::from(2)
+    })?;
+
+    let mut merged = set.clone();
+    for (host, upstream) in declared {
+        if let Err(error) = merged.add(&host, &upstream) {
+            eprintln!(
+                "adev: {error} — {host} is named both by a service and in {}",
+                config.caddy.domains.display()
+            );
+            return Err(ExitCode::from(2));
+        }
+    }
+    Ok(merged)
+}
+
 fn save_domains(config: &Config, set: &DomainSet, no_reload: bool) -> ExitCode {
+    let routes = match all_routes(config, set) {
+        Ok(routes) => routes,
+        Err(code) => return code,
+    };
+    // The file keeps only what was edited through it. What the services ask
+    // for is written into the generated config and nowhere else.
     if let Err(error) = std::fs::write(&config.caddy.domains, set.to_toml_string()) {
         eprintln!(
             "adev: cannot write {}: {error}",
@@ -600,7 +778,7 @@ fn save_domains(config: &Config, set: &DomainSet, no_reload: bool) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    if let Err(error) = std::fs::write(&config.caddy.caddyfile, set.to_caddyfile()) {
+    if let Err(error) = std::fs::write(&config.caddy.caddyfile, routes.to_caddyfile()) {
         eprintln!(
             "adev: cannot write {}: {error}",
             config.caddy.caddyfile.display()
@@ -640,14 +818,29 @@ fn domains(config: &Config, command: DomainCommand) -> ExitCode {
 
     match command {
         DomainCommand::List => {
-            for domain in set.entries() {
-                outln!("{:<30} -> {}", clip(&domain.host, 30), domain.upstream);
+            let routes = match all_routes(config, &set) {
+                Ok(routes) => routes,
+                Err(code) => return code,
+            };
+            let from_file: Vec<&str> = set.entries().iter().map(|d| d.host.as_str()).collect();
+            for domain in routes.entries() {
+                // Which of the two named it decides where to go to change it.
+                let source = if from_file.contains(&domain.host.as_str()) {
+                    ""
+                } else {
+                    "  (from its service)"
+                };
+                outln!(
+                    "{:<30} -> {}{source}",
+                    clip(&domain.host, 30),
+                    domain.upstream
+                );
             }
             // Saying where the answer came from matters when the answer is
             // empty: an unconfigured file and no routes look the same.
             outln!(
-                "\n{} routed, from {}",
-                set.entries().len(),
+                "\n{} routed, from {} and the declared services",
+                routes.entries().len(),
                 config.caddy.domains.display()
             );
             ExitCode::SUCCESS
@@ -673,26 +866,66 @@ fn domains(config: &Config, command: DomainCommand) -> ExitCode {
     }
 }
 
-/// Finds the container behind a compose service name, accepting the container
-/// name too since that is what `docker ps` shows and what people often type.
-fn container_for(client: &HttpDockerClient, service: &str) -> Result<String, ExitCode> {
-    let services = client.services().map_err(|error| {
+/// The database account configured for a service, or an empty one that leaves
+/// the container's own environment to answer.
+///
+/// The name is matched against both the declared service and the container it
+/// names, because either is a reasonable thing to have typed.
+fn account_for(config: &Config, service: &str) -> Account {
+    config
+        .service
+        .iter()
+        .find(|(name, settings)| {
+            name.as_str() == service || settings.container_for(name) == service
+        })
+        .map(|(_, settings)| Account {
+            user: settings.user.clone(),
+            password: settings.password.clone(),
+            password_env: settings.password_env.clone(),
+        })
+        .unwrap_or_default()
+}
+
+/// Finds the container behind a service name, accepting the container name too
+/// since that is what `docker ps` shows and what people often type.
+///
+/// Declared services are searched alongside the running ones, so a name that
+/// only exists in the configuration still resolves — and a service that was
+/// declared but never created says so, instead of being reported as unknown.
+fn container_for(
+    client: &HttpDockerClient,
+    config: &Config,
+    service: &str,
+) -> Result<String, ExitCode> {
+    let observed = client.services().map_err(|error| {
         eprintln!("adev: {error}");
         ExitCode::from(2)
     })?;
+    let services = catalog::merge(&config.services_declared(), &observed);
 
-    services
+    let found = services
         .iter()
-        .find(|candidate| candidate.service == service || candidate.container == service)
-        .map(|found| found.container.clone())
-        .ok_or_else(|| {
+        .find(|candidate| candidate.service == service || candidate.container == service);
+
+    match found {
+        Some(found) if found.state == ServiceState::Absent => {
+            eprintln!(
+                "adev: {service:?} is declared but has no container called {:?} — create it first \
+                 (docker compose up -d {service})",
+                found.container
+            );
+            Err(ExitCode::from(2))
+        }
+        Some(found) => Ok(found.container.clone()),
+        None => {
             let known: Vec<&str> = services.iter().map(|s| s.service.as_str()).collect();
             eprintln!(
                 "adev: no service called {service:?}; known: {}",
                 known.join(", ")
             );
-            ExitCode::from(2)
-        })
+            Err(ExitCode::from(2))
+        }
+    }
 }
 
 fn db(config: &Config, command: DbCommand) -> ExitCode {
@@ -733,7 +966,7 @@ fn export(
         Ok(client) => client,
         Err(code) => return code,
     };
-    let container = match container_for(&client, service) {
+    let container = match container_for(&client, config, service) {
         Ok(container) => container,
         Err(code) => return code,
     };
@@ -752,7 +985,7 @@ fn export(
         );
         return ExitCode::from(2);
     };
-    let plan = match dump_plan(engine, database, &detail.env) {
+    let plan = match dump_plan(engine, database, &detail.env, &account_for(config, service)) {
         Ok(plan) => plan,
         Err(error) => {
             eprintln!("adev: {error}");
@@ -842,7 +1075,7 @@ fn import(config: &Config, service: &str, database: &str, file: &Path) -> ExitCo
         Ok(client) => client,
         Err(code) => return code,
     };
-    let container = match container_for(&client, service) {
+    let container = match container_for(&client, config, service) {
         Ok(container) => container,
         Err(code) => return code,
     };
@@ -870,7 +1103,13 @@ fn import(config: &Config, service: &str, database: &str, file: &Path) -> ExitCo
     let name = format!("adev-import-{stamp}");
     let remote = format!("/tmp/{name}");
 
-    let plan = match restore_plan(engine, database, &remote, &detail.env) {
+    let plan = match restore_plan(
+        engine,
+        database,
+        &remote,
+        &detail.env,
+        &account_for(config, service),
+    ) {
         Ok(plan) => plan,
         Err(error) => {
             eprintln!("adev: {error}");
@@ -932,7 +1171,7 @@ fn logs(config: &Config, service: &str, follow: bool, tail: Option<u32>) -> Exit
         Ok(client) => client,
         Err(code) => return code,
     };
-    let container = match container_for(&client, service) {
+    let container = match container_for(&client, config, service) {
         Ok(container) => container,
         Err(code) => return code,
     };
@@ -985,18 +1224,26 @@ fn lifecycle(config: &Config, names: &[String], all: bool, action: Action) -> Ex
         Ok(client) => client,
         Err(code) => return code,
     };
-    let services = match client.services() {
+    let observed = match client.services() {
         Ok(services) => services,
         Err(error) => {
             eprintln!("adev: {error}");
             return ExitCode::from(2);
         }
     };
+    let services = catalog::merge(&config.services_declared(), &observed);
 
     // --all means every container there is, so the names are taken from what
-    // docker reports rather than from the command line.
+    // docker reports rather than from the command line. A declared service with
+    // no container is skipped rather than attempted: --all is a convenience,
+    // and it should not turn into a row of failures for services the user never
+    // asked about by name.
     let chosen: Vec<String> = if all {
-        services.iter().map(|s| s.service.clone()).collect()
+        services
+            .iter()
+            .filter(|s| s.state != ServiceState::Absent)
+            .map(|s| s.service.clone())
+            .collect()
     } else {
         names.to_vec()
     };
@@ -1009,13 +1256,19 @@ fn lifecycle(config: &Config, names: &[String], all: bool, action: Action) -> Ex
         let Some(service) = found else {
             // One name nobody recognises must not cancel the others: a typo in
             // the third argument should not leave the first two untouched.
-            eprintln!(
-                "adev: no container for {name:?}; a service the compose file defines but that \
-                 has never been created has nothing to act on"
-            );
+            eprintln!("adev: no service called {name:?}");
             refused = true;
             continue;
         };
+        if service.state == ServiceState::Absent {
+            eprintln!(
+                "adev: {name:?} is declared but has no container called {:?} — create it first \
+                 (docker compose up -d {name})",
+                service.container
+            );
+            refused = true;
+            continue;
+        }
 
         let outcome = match action {
             Action::Start => client.start(&service.container),
@@ -1098,6 +1351,68 @@ fn backup_directory_name() -> String {
     )
 }
 
+/// What one service contributed to a backup.
+enum Dumped {
+    /// Nothing to dump, and no failure either: the container is not running,
+    /// or holds no database. The reason is carried because a backup that
+    /// quietly leaves something out is the kind of gap nobody finds until they
+    /// need the file.
+    Nothing(String),
+    Written {
+        path: PathBuf,
+        bytes: u64,
+        /// What the dump tool wrote to stderr while still succeeding.
+        warnings: Vec<u8>,
+    },
+}
+
+/// Dumps every database on one service into `directory`.
+///
+/// Shared by `adev db backup` and the dashboard, so the two cannot drift into
+/// producing different files from the same button.
+fn dump_service(
+    client: &HttpDockerClient,
+    config: &Config,
+    service: &ServiceStatus,
+    directory: &Path,
+    gzip: bool,
+) -> Result<Dumped, String> {
+    if service.state != ServiceState::Running {
+        return Ok(Dumped::Nothing(format!(
+            "{} is not running",
+            service.service
+        )));
+    }
+    let detail = client
+        .inspect(&service.container)
+        .map_err(|error| format!("{}: {error}", service.container))?;
+    let Some(engine) = Engine::from_image(&detail.image) else {
+        return Ok(Dumped::Nothing(format!(
+            "{} holds no database",
+            service.service
+        )));
+    };
+    let plan = dump_all_plan(engine, &detail.env, &account_for(config, &service.service))
+        .map_err(|error| format!("{}: {error}", service.service))?;
+
+    let path = directory.join(backup_filename(&service.service, engine, gzip));
+    match dump_to_file(client, &service.container, &plan, &path, gzip) {
+        Ok((bytes, warnings)) => Ok(Dumped::Written {
+            path,
+            bytes,
+            warnings,
+        }),
+        Err(reason) => {
+            // A half-written dump that looks like a backup is worse than none.
+            let _ = std::fs::remove_file(&path);
+            Err(format!(
+                "{} failed, its file removed: {reason}",
+                service.service
+            ))
+        }
+    }
+}
+
 fn backup(config: &Config, out: &Path, gzip: bool) -> ExitCode {
     let client = match docker_client(config) {
         Ok(client) => client,
@@ -1122,36 +1437,16 @@ fn backup(config: &Config, out: &Path, gzip: bool) -> ExitCode {
     let mut failed = false;
 
     for service in &services {
-        if service.state != ServiceState::Running {
+        match dump_service(&client, config, service, &directory, gzip) {
             // Said out loud rather than skipped in silence: a backup that
             // quietly leaves out a stopped database is the kind of gap nobody
             // finds until they need the file.
-            outln!("skipped {} (not running)", service.service);
-            continue;
-        }
-        let detail = match client.inspect(&service.container) {
-            Ok(detail) => detail,
-            Err(error) => {
-                eprintln!("adev: {}: {error}", service.container);
-                failed = true;
-                continue;
-            }
-        };
-        let Some(engine) = Engine::from_image(&detail.image) else {
-            continue;
-        };
-        let plan = match dump_all_plan(engine, &detail.env) {
-            Ok(plan) => plan,
-            Err(error) => {
-                eprintln!("adev: {}: {error}", service.service);
-                failed = true;
-                continue;
-            }
-        };
-
-        let path = directory.join(backup_filename(&service.service, engine, gzip));
-        match dump_to_file(&client, &service.container, &plan, &path, gzip) {
-            Ok((bytes, warnings)) => {
+            Ok(Dumped::Nothing(reason)) => outln!("skipped {reason}"),
+            Ok(Dumped::Written {
+                path,
+                bytes,
+                warnings,
+            }) => {
                 if !warnings.is_empty() {
                     eprintln!(
                         "adev: {}: {}",
@@ -1163,11 +1458,7 @@ fn backup(config: &Config, out: &Path, gzip: bool) -> ExitCode {
                 written += 1;
             }
             Err(reason) => {
-                let _ = std::fs::remove_file(&path);
-                eprintln!(
-                    "adev: {} failed, its file removed: {reason}",
-                    service.service
-                );
+                eprintln!("adev: {reason}");
                 failed = true;
             }
         }
@@ -1266,6 +1557,8 @@ fn toolchains_for(config: &Config, name: &str, path: &Path) -> Vec<(String, Reso
     let read = |file: &str| std::fs::read_to_string(path.join(file)).ok();
     let composer = read("composer.json");
     let package = read("package.json");
+    let entries = entries_in(path);
+    let present: Vec<&str> = entries.iter().map(String::as_str).collect();
 
     let mut resolved = Vec::new();
     for (tool, settings) in &config.toolchain {
@@ -1273,15 +1566,15 @@ fn toolchains_for(config: &Config, name: &str, path: &Path) -> Vec<(String, Reso
         let declared = match tool.as_str() {
             "php" => composer.as_deref().and_then(toolchain::wanted_php),
             "node" => package.as_deref().and_then(toolchain::wanted_node),
+            // Nothing else has a manifest this reads a version out of yet, so
+            // the choice falls to a pin or to the newest installed.
             _ => None,
         };
-        let relevant = pinned.is_some()
-            || match tool.as_str() {
-                "php" => composer.is_some(),
-                "node" => package.is_some(),
-                _ => false,
-            };
-        if !relevant {
+        // A pin is a decision already made, so it applies whatever the project
+        // holds. Otherwise the tool's own `when` decides, which is how a Go or
+        // Python toolchain becomes relevant without this code having to know
+        // the language exists.
+        if pinned.is_none() && !toolchain::applies_named(tool, settings, &present) {
             continue;
         }
 
@@ -1582,29 +1875,31 @@ fn spawn_service_action(
 }
 
 /// Hands a URL to whatever the system opens links with.
-fn open_in_browser(url: &str) -> std::io::Result<()> {
-    #[cfg(windows)]
-    let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        // The empty argument is the window title start expects; without it the
-        // URL is taken as the title and nothing opens.
-        command.args(["/C", "start", "", url]);
-        command
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = std::process::Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut command = std::process::Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
+/// Hands `target` to whichever command the configuration says opens that kind
+/// of thing.
+fn spawn_opener(template: &[String], target: &str) -> std::io::Result<()> {
+    let line = open::command_line(template, target).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nothing is configured to open this",
+        )
+    })?;
+    let (program, arguments) = line.split_first().expect("command_line never yields none");
+    std::process::Command::new(program)
+        .args(arguments)
+        .spawn()
+        .map(|_| ())
+}
 
-    command.spawn().map(|_| ())
+/// The page a service says is worth opening, if it named one.
+fn panel_for(config: &Config, service: &str) -> Option<String> {
+    config
+        .service
+        .iter()
+        .find(|(name, settings)| {
+            name.as_str() == service || settings.container_for(name) == service
+        })
+        .and_then(|(_, settings)| settings.panel.clone())
 }
 
 /// Opens a service or a project in a browser.
@@ -1618,7 +1913,7 @@ fn open(config: &Config, target: &str) -> ExitCode {
             .find(|s| s.service == target || s.container == target)
         {
             return match service.port {
-                Some(port) => open_url(&format!("http://localhost:{port}")),
+                Some(port) => open_url(config, &format!("http://localhost:{port}")),
                 None => {
                     eprintln!("adev: {target} publishes no port to open");
                     ExitCode::from(2)
@@ -1635,7 +1930,7 @@ fn open(config: &Config, target: &str) -> ExitCode {
     let present: Vec<&str> = entries.iter().map(String::as_str).collect();
     match recipe::plan_for(&name, &present, &config.recipe, &config.run).and_then(|plan| plan.port)
     {
-        Some(port) => open_url(&format!("http://localhost:{port}")),
+        Some(port) => open_url(config, &format!("http://localhost:{port}")),
         None => {
             eprintln!("adev: nothing here says which address {name} would serve on");
             ExitCode::from(2)
@@ -1643,8 +1938,8 @@ fn open(config: &Config, target: &str) -> ExitCode {
     }
 }
 
-fn open_url(url: &str) -> ExitCode {
-    match open_in_browser(url) {
+fn open_url(config: &Config, url: &str) -> ExitCode {
+    match spawn_opener(&config.open.browser, url) {
         Ok(()) => {
             outln!("opened {url}");
             ExitCode::SUCCESS
@@ -1945,6 +2240,44 @@ fn settings(
     outln!("  container   {}", config.caddy.container);
     outln!("  caddyfile   {}", config.caddy.caddyfile.display());
     outln!("  domains     {}", config.caddy.domains.display());
+    outln!("[open]");
+    outln!("  browser     {}", config.open.browser.join(" "));
+    outln!("  file_manager {}", config.open.file_manager.join(" "));
+    outln!("[backup]");
+    outln!("  directory   {}", config.backup.directory.display());
+    outln!("  gzip        {}", config.backup.gzip);
+    outln!("[memory]");
+    outln!("  interval    {}s", config.memory.interval_secs);
+    outln!("  guest       {}", config.memory.guest.join(" "));
+    outln!("  host_process {}", config.memory.host_process.join(", "));
+
+    if config.service.is_empty() {
+        outln!("\n[service]  none declared — the list is whatever docker reports");
+    } else {
+        for (name, settings) in config.services_declared() {
+            outln!("\n[service.{name}]");
+            outln!("  container   {}", settings.container_for(&name));
+            if let Some(port) = settings.port {
+                outln!("  port        {port}");
+            }
+            if let Some(domain) = &settings.domain {
+                outln!("  domain      {domain}");
+            }
+            if let Some(panel) = &settings.panel {
+                outln!("  panel       {panel}");
+            }
+            if let Some(user) = &settings.user {
+                outln!("  user        {user}");
+            }
+            // Which variable, never what is in it: this output gets pasted
+            // into bug reports.
+            if let Some(variable) = &settings.password_env {
+                outln!("  password    read from {variable}");
+            } else if settings.password.is_some() {
+                outln!("  password    set in this file");
+            }
+        }
+    }
 
     if config.toolchain.is_empty() {
         outln!("\n[toolchain]  nothing configured — adev config --init finds what is here");
@@ -1998,6 +2331,35 @@ fn settings_lines(config: &Config, chosen: Option<&Path>) -> Vec<(String, String
         "caddy.container".to_string(),
         config.caddy.container.clone(),
     ));
+    lines.push((
+        "backup.directory".to_string(),
+        config.backup.directory.display().to_string(),
+    ));
+    lines.push(("open.browser".to_string(), config.open.browser.join(" ")));
+    lines.push((
+        "open.file_manager".to_string(),
+        config.open.file_manager.join(" "),
+    ));
+
+    // What is declared, not what docker happens to be running: this screen
+    // answers "what did I configure", and the services pane answers the rest.
+    if config.service.is_empty() {
+        lines.push((
+            "service".to_string(),
+            "none declared — the list is whatever docker reports".to_string(),
+        ));
+    } else {
+        for (name, settings) in config.services_declared() {
+            let mut parts = vec![settings.container_for(&name)];
+            if let Some(port) = settings.port {
+                parts.push(format!("port {port}"));
+            }
+            if let Some(domain) = &settings.domain {
+                parts.push(domain.clone());
+            }
+            lines.push((format!("service.{name}"), parts.join(" · ")));
+        }
+    }
 
     if config.toolchain.is_empty() {
         lines.push((

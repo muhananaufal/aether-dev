@@ -693,10 +693,20 @@ mod tests {
 
     #[test]
     fn a_port_with_nothing_listening_does_not() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        assert!(!probe_port(port, std::time::Duration::from_millis(300)));
+        // Retried on purpose. Between releasing a port and asking about it, the
+        // operating system is free to hand it to something else — and a test
+        // that fails once a fortnight in CI teaches people to ignore CI.
+        // Answering on all five would still be a real failure.
+        let always_answered = (0..5).all(|_| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            probe_port(port, std::time::Duration::from_millis(300))
+        });
+        assert!(
+            !always_answered,
+            "a port nothing is listening on must not answer"
+        );
     }
 
     #[test]
