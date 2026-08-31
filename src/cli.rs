@@ -47,6 +47,25 @@ pub enum Command {
     /// Manage the local reverse-proxy hostnames.
     #[command(subcommand)]
     Domains(DomainCommand),
+    /// Start services that already exist but are stopped.
+    ///
+    /// This starts existing containers. A service the compose file defines but
+    /// that has never been created has no container to start, and is reported
+    /// as such rather than silently skipped.
+    Start {
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
+    /// Stop running services, leaving their containers in place.
+    Stop {
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
+    /// Restart services.
+    Restart {
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
     /// Follow what a service is writing.
     Logs {
         /// Service or container to read.
@@ -316,5 +335,37 @@ mod tests {
                 tail: Some(50),
             }
         );
+    }
+
+    #[test]
+    fn services_can_be_started_stopped_and_restarted_by_name() {
+        assert_eq!(
+            Cli::parse_from(["adev", "start", "mysql", "postgres"]).command,
+            Command::Start {
+                services: vec!["mysql".to_string(), "postgres".to_string()]
+            }
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "stop", "mysql"]).command,
+            Command::Stop {
+                services: vec!["mysql".to_string()]
+            }
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "restart", "caddy"]).command,
+            Command::Restart {
+                services: vec!["caddy".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn an_action_with_no_service_named_is_refused_rather_than_applied_to_everything() {
+        assert!(
+            Cli::try_parse_from(["adev", "stop"]).is_err(),
+            "stopping every service because none was named is not a plausible intent"
+        );
+        assert!(Cli::try_parse_from(["adev", "start"]).is_err());
+        assert!(Cli::try_parse_from(["adev", "restart"]).is_err());
     }
 }

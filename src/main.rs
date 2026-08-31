@@ -54,6 +54,9 @@ fn main() -> ExitCode {
         Command::Ports { json } => ports(&config, json),
         Command::Db(command) => db(&config, command),
         Command::Domains(command) => domains(&config, command),
+        Command::Start { services } => lifecycle(&config, &services, Action::Start),
+        Command::Stop { services } => lifecycle(&config, &services, Action::Stop),
+        Command::Restart { services } => lifecycle(&config, &services, Action::Restart),
         Command::Logs {
             service,
             follow,
@@ -773,5 +776,76 @@ fn logs(config: &Config, service: &str, follow: bool, tail: Option<u32>) -> Exit
             eprintln!("adev: {error}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Action {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl Action {
+    fn done(self) -> &'static str {
+        match self {
+            Action::Start => "started",
+            Action::Stop => "stopped",
+            Action::Restart => "restarted",
+        }
+    }
+}
+
+fn lifecycle(config: &Config, names: &[String], action: Action) -> ExitCode {
+    let client = match docker_client(config) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let services = match client.services() {
+        Ok(services) => services,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut refused = false;
+    for name in names {
+        let found = services
+            .iter()
+            .find(|candidate| candidate.service == *name || candidate.container == *name);
+        let Some(service) = found else {
+            // One name nobody recognises must not cancel the others: a typo in
+            // the third argument should not leave the first two untouched.
+            eprintln!(
+                "adev: no container for {name:?}; a service the compose file defines but that \
+                 has never been created has nothing to act on"
+            );
+            refused = true;
+            continue;
+        };
+
+        let outcome = match action {
+            Action::Start => client.start(&service.container),
+            Action::Stop => client.stop(&service.container),
+            Action::Restart => client.restart(&service.container),
+        };
+        match outcome {
+            Ok(()) => outln!("{} {}", action.done(), service.container),
+            Err(error) => {
+                eprintln!(
+                    "adev: {} could not be {}: {error}",
+                    service.container,
+                    action.done()
+                );
+                refused = true;
+            }
+        }
+    }
+
+    if refused {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
     }
 }

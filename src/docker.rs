@@ -25,9 +25,15 @@ pub enum DockerError {
 pub trait DockerClient: Send + Sync {
     fn services(&self) -> Result<Vec<ServiceStatus>, DockerError>;
 
-    /// Restarts a container so it re-reads a config file that changed on disk.
-    /// A restart rather than a graceful reload: it is one request instead of an
-    /// exec session, and a local proxy blinking for a moment costs nothing.
+    /// Starts a container that already exists.
+    fn start(&self, container: &str) -> Result<(), DockerError>;
+
+    /// Stops a running container, leaving it in place to be started again.
+    fn stop(&self, container: &str) -> Result<(), DockerError>;
+
+    /// Restarts a container, which is also how a proxy re-reads a config file
+    /// that changed on disk: one request instead of an exec session, and a
+    /// local proxy blinking for a moment costs nothing.
     fn restart(&self, container: &str) -> Result<(), DockerError>;
 }
 
@@ -199,15 +205,16 @@ impl DockerClient for HttpDockerClient {
         parse_containers(&body)
     }
 
+    fn start(&self, container: &str) -> Result<(), DockerError> {
+        self.lifecycle(container, "start")
+    }
+
+    fn stop(&self, container: &str) -> Result<(), DockerError> {
+        self.lifecycle(container, "stop")
+    }
+
     fn restart(&self, container: &str) -> Result<(), DockerError> {
-        let url = format!("{}/containers/{container}/restart", self.base);
-        ureq::post(&url)
-            .send_empty()
-            .map_err(|error| DockerError::Unreachable {
-                endpoint: self.base.clone(),
-                reason: error.to_string(),
-            })?;
-        Ok(())
+        self.lifecycle(container, "restart")
     }
 }
 
@@ -367,6 +374,18 @@ struct ExecInspect {
 }
 
 impl HttpDockerClient {
+    /// The daemon answers 304 when a container is already in the state asked
+    /// for. That is the desired outcome, not a failure, so it is not treated
+    /// as one.
+    fn lifecycle(&self, container: &str, action: &str) -> Result<(), DockerError> {
+        let url = format!("{}/containers/{container}/{action}", self.base);
+        match ureq::post(&url).send_empty() {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::StatusCode(304)) => Ok(()),
+            Err(error) => Err(self.unreachable(error.to_string())),
+        }
+    }
+
     fn unreachable(&self, reason: String) -> DockerError {
         DockerError::Unreachable {
             endpoint: self.base.clone(),
