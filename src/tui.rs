@@ -217,6 +217,11 @@ pub struct Dashboard {
     /// The log being watched, when one is. While it is open it takes the whole
     /// screen: a log is read, not glanced at beside three other lists.
     logs: Option<LogView>,
+    /// The settings in force, already turned into lines by the caller. The
+    /// dashboard never reads configuration itself: it shows what it is told,
+    /// which keeps it free of anything that touches a file.
+    settings: Vec<(String, String)>,
+    showing_settings: bool,
 }
 
 impl Default for Dashboard {
@@ -239,6 +244,8 @@ impl Dashboard {
             notice: None,
             help: false,
             logs: None,
+            settings: Vec::new(),
+            showing_settings: false,
         }
     }
 
@@ -285,6 +292,19 @@ impl Dashboard {
             let furthest = view.lines.len().saturating_sub(1) as isize;
             view.scroll = (view.scroll as isize - delta).clamp(0, furthest) as usize;
         }
+    }
+
+    /// Hands the dashboard the settings to show, already flattened to lines.
+    pub fn set_settings(&mut self, settings: Vec<(String, String)>) {
+        self.settings = settings;
+    }
+
+    pub fn toggle_settings(&mut self) {
+        self.showing_settings = !self.showing_settings;
+    }
+
+    pub fn showing_settings(&self) -> bool {
+        self.showing_settings
     }
 
     pub fn toggle_help(&mut self) {
@@ -387,9 +407,7 @@ impl Dashboard {
     pub fn draw(&mut self, frame: &mut Frame) {
         if let Some(view) = &self.logs {
             draw_logs(frame, view);
-            if self.help {
-                draw_help(frame);
-            }
+            self.draw_overlays(frame);
             return;
         }
 
@@ -422,6 +440,15 @@ impl Dashboard {
             frame.render_widget(self.status_line(), status);
         }
 
+        self.draw_overlays(frame);
+    }
+
+    /// Whatever is layered over the screen. Settings first, so the key list
+    /// opened on top of it is the one that closes first.
+    fn draw_overlays(&self, frame: &mut Frame) {
+        if self.showing_settings {
+            draw_settings(frame, &self.settings);
+        }
         if self.help {
             draw_help(frame);
         }
@@ -678,6 +705,7 @@ const KEYS: &[(&str, &str)] = &[
     ("l", "read the selected service's log"),
     ("t", "open a shell in a project, on its own toolchain"),
     ("r", "refresh everything"),
+    ("g", "the settings in force, and where they live"),
     ("?", "this list"),
     ("q", "quit"),
 ];
@@ -784,6 +812,50 @@ fn draw_logs(frame: &mut Frame, view: &LogView) {
         )
     };
     frame.render_widget(Paragraph::new(Line::from(position)), status);
+}
+
+/// Draws the settings in force over whatever is behind them.
+///
+/// Read-only on purpose. The configuration file carries comments explaining
+/// each choice, and rewriting it from a form would throw those away every time
+/// somebody changed a number - so this says what is in force and where to go
+/// and change it.
+fn draw_settings(frame: &mut Frame, lines: &[(String, String)]) {
+    let width = 74;
+    let height = (lines.len() as u16 + 2).min(frame.area().height);
+    let area = centred(frame.area(), width, height);
+
+    let rows: Vec<Row<'static>> = lines
+        .iter()
+        .map(|(key, value)| {
+            Row::new(vec![
+                Cell::from(key.clone()).style(Style::default().fg(paint::MUTED)),
+                Cell::from(value.clone()),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Table::new(rows, [Constraint::Length(20), Constraint::Fill(1)])
+            .block(
+                Block::bordered()
+                    .border_style(Style::default().fg(paint::FOCUS))
+                    .padding(Padding::horizontal(1))
+                    .title(Span::styled(
+                        " Settings ",
+                        Style::default()
+                            .fg(paint::FOCUS)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .title_bottom(Span::styled(
+                        " adev config --edit to change · g or esc to close ",
+                        Style::default().fg(paint::MUTED),
+                    )),
+            )
+            .column_spacing(2),
+        area,
+    );
 }
 
 /// Draws the key list over whatever is behind it.
@@ -1372,5 +1444,42 @@ mod tests {
         });
         let view = screen(&drawn(&mut dashboard, 120, 12));
         assert!(view.contains("following") && view.contains("started"));
+    }
+
+    #[test]
+    fn the_settings_in_force_can_be_looked_at_from_the_dashboard() {
+        let mut dashboard = with_projects(3);
+        dashboard.set_settings(vec![
+            ("file".to_string(), "C:/Users/x/aether.toml".to_string()),
+            ("toolchain.php".to_string(), "4 installed".to_string()),
+        ]);
+
+        let quiet = screen(&drawn(&mut dashboard, 120, 24));
+        assert!(!quiet.contains("aether.toml"));
+
+        dashboard.toggle_settings();
+        let showing = screen(&drawn(&mut dashboard, 120, 24));
+        assert!(showing.contains("Settings"));
+        assert!(
+            showing.contains("aether.toml"),
+            "where the settings came from is the thing people are looking for"
+        );
+        assert!(showing.contains("4 installed"));
+        assert!(
+            showing.contains("adev config --edit"),
+            "showing settings with no way to change them is a dead end"
+        );
+
+        dashboard.toggle_settings();
+        assert!(!screen(&drawn(&mut dashboard, 120, 24)).contains("Settings"));
+    }
+
+    #[test]
+    fn the_settings_can_be_read_while_a_log_is_open() {
+        let mut dashboard = Dashboard::new();
+        dashboard.set_settings(vec![("file".to_string(), "somewhere.toml".to_string())]);
+        dashboard.open_logs("mysql-1".to_string());
+        dashboard.toggle_settings();
+        assert!(screen(&drawn(&mut dashboard, 120, 20)).contains("somewhere.toml"));
     }
 }

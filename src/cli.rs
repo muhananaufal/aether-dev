@@ -154,6 +154,19 @@ pub enum Command {
         target: String,
     },
 
+    /// Show the settings in force, and where they came from.
+    #[command(display_order = 18)]
+    Config {
+        /// Write a starter configuration describing this machine.
+        #[arg(long)]
+        init: bool,
+        /// Open the configuration in your editor.
+        #[arg(long)]
+        edit: bool,
+        /// Replace an existing configuration rather than leaving it alone.
+        #[arg(long)]
+        force: bool,
+    },
     /// Dump and restore databases.
     #[command(subcommand, display_order = 16)]
     Db(DbCommand),
@@ -644,5 +657,25 @@ mod tests {
                 use_file: Some(".env.staging".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn the_settings_can_be_shown_started_or_opened() {
+        assert_eq!(
+            Cli::parse_from(["adev", "config"]).command,
+            Command::Config {
+                init: false,
+                edit: false,
+                force: false,
+            }
+        );
+        assert!(matches!(
+            Cli::parse_from(["adev", "config", "--init"]).command,
+            Command::Config { init: true, .. }
+        ));
+        assert!(matches!(
+            Cli::parse_from(["adev", "config", "--edit"]).command,
+            Command::Config { edit: true, .. }
+        ));
     }
 }

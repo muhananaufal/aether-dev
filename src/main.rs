@@ -62,7 +62,10 @@ fn main() -> ExitCode {
         let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         config::discover(&here, machine_config().as_deref())
     });
-    let config = match Config::load(chosen.as_deref()) {
+    // The one command whose job is to create the file cannot require it to
+    // already exist, or --config somewhere-new fails before it can write there.
+    let writing_one = matches!(cli.command, Command::Config { init: true, .. });
+    let config = match Config::load(chosen.as_deref().filter(|_| !writing_one)) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("adev: {error}");
@@ -94,7 +97,10 @@ fn main() -> ExitCode {
             project,
             shell: named,
         } => shell(&config, &project, named.as_deref()),
-        Command::Tui => tui(&config),
+        Command::Config { init, edit, force } => {
+            settings(&config, chosen.as_deref(), init, edit, force)
+        }
+        Command::Tui => tui(&config, chosen.as_deref()),
     }
 }
 
@@ -415,13 +421,14 @@ fn spawn_collectors(config: &Config, updates: Sender<Update>) {
     });
 }
 
-fn tui(config: &Config) -> ExitCode {
+fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
     let mut dashboard = Dashboard::new();
     let (updates, incoming) = mpsc::channel();
     spawn_collectors(config, updates.clone());
     // Held so closing the view can unwind the reader, which is otherwise
     // blocked waiting for a line that may never come.
     let mut watching: Option<Arc<AtomicBool>> = None;
+    dashboard.set_settings(settings_lines(config, chosen));
 
     let outcome: std::io::Result<Leave> = ratatui::run(|terminal| {
         loop {
@@ -467,6 +474,7 @@ fn tui(config: &Config) -> ExitCode {
 
             match key.code {
                 KeyCode::Char('?') => dashboard.toggle_help(),
+                KeyCode::Char('g') => dashboard.toggle_settings(),
                 KeyCode::Char('l') => match dashboard.selected_service() {
                     Some(service) => {
                         let container = service.container.clone();
@@ -481,6 +489,7 @@ fn tui(config: &Config) -> ExitCode {
                 // Esc closes the key list when it is open, and only quits when
                 // there is nothing left to close.
                 KeyCode::Esc if dashboard.showing_help() => dashboard.toggle_help(),
+                KeyCode::Esc if dashboard.showing_settings() => dashboard.toggle_settings(),
                 KeyCode::Char('q') | KeyCode::Esc => break Ok(Leave::Quit),
                 KeyCode::Tab | KeyCode::Right => dashboard.focus_next(),
                 KeyCode::BackTab | KeyCode::Left => dashboard.focus_previous(),
@@ -1810,4 +1819,212 @@ fn spawn_log_stream(
     });
 
     stop
+}
+
+/// The places a toolchain is commonly installed on this platform. Used only by
+/// `--init`, and only to decide what to look at: a directory that turns out to
+/// hold nothing is left out of what gets written.
+fn likely_toolchains() -> Vec<(String, PathBuf, String)> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+
+    #[cfg(windows)]
+    let candidates = vec![
+        ("php", PathBuf::from("C:/ProgramData/php"), "php.exe"),
+        ("php", PathBuf::from("C:/laragon/bin/php"), "php.exe"),
+        (
+            "php",
+            PathBuf::from("C:/ProgramData/laragon/bin/php"),
+            "php.exe",
+        ),
+        (
+            "node",
+            home.clone()
+                .map(|home| home.join("AppData/Local/nvm"))
+                .unwrap_or_default(),
+            "node.exe",
+        ),
+    ];
+    #[cfg(not(windows))]
+    let candidates = vec![
+        (
+            "node",
+            home.clone()
+                .map(|home| home.join(".nvm/versions/node"))
+                .unwrap_or_default(),
+            "node",
+        ),
+        ("php", PathBuf::from("/usr/local/opt"), "php"),
+    ];
+
+    candidates
+        .into_iter()
+        .map(|(tool, path, binary)| (tool.to_string(), path, binary.to_string()))
+        .collect()
+}
+
+fn settings(
+    config: &Config,
+    chosen: Option<&Path>,
+    init: bool,
+    edit: bool,
+    force: bool,
+) -> ExitCode {
+    let target = chosen
+        .map(Path::to_path_buf)
+        .or_else(machine_config)
+        .unwrap_or_else(|| PathBuf::from(config::CONFIG_NAME));
+
+    if init {
+        if target.exists() && !force {
+            eprintln!(
+                "adev: {} already exists; pass --force to replace it",
+                target.display()
+            );
+            return ExitCode::from(2);
+        }
+        let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let written = config::starter(
+            &[here],
+            &likely_toolchains(),
+            std::env::var("DOCKER_HOST").ok().as_deref(),
+        );
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        return match std::fs::write(&target, &written) {
+            Ok(()) => {
+                outln!("wrote {}", target.display());
+                outln!("\n{written}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("adev: cannot write {}: {error}", target.display());
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    if edit {
+        let Some(editor) = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+        else {
+            eprintln!("adev: no EDITOR or VISUAL is set, so there is nothing to open it with");
+            return ExitCode::from(2);
+        };
+        // Edited in a real editor rather than a form, so the comments
+        // explaining each choice survive being changed.
+        return match std::process::Command::new(&editor).arg(&target).status() {
+            Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+            Err(error) => {
+                eprintln!("adev: cannot run {editor}: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    match chosen {
+        Some(path) => outln!("read from {}", path.display()),
+        // Said plainly, because "why is it not seeing my roots" is almost
+        // always this.
+        None => outln!("no configuration file was found — every default is in force"),
+    }
+    outln!("would be written to {}\n", target.display());
+
+    outln!("[project]");
+    outln!("  roots       {:?}", config.project.roots);
+    outln!("  max_depth   {}", config.project.max_depth);
+    outln!("[scan]");
+    outln!("  workers     {}", config.scan.workers);
+    outln!("[docker]");
+    outln!("  endpoint    {}", config.docker.endpoint);
+    outln!("[caddy]");
+    outln!("  container   {}", config.caddy.container);
+    outln!("  caddyfile   {}", config.caddy.caddyfile.display());
+    outln!("  domains     {}", config.caddy.domains.display());
+
+    if config.toolchain.is_empty() {
+        outln!("\n[toolchain]  nothing configured — adev config --init finds what is here");
+    } else {
+        for (tool, settings) in &config.toolchain {
+            let found = toolchain::discover(settings);
+            outln!(
+                "\n[toolchain.{tool}]  {} installed",
+                if found.is_empty() {
+                    "none".to_string()
+                } else {
+                    found.len().to_string()
+                }
+            );
+            for installed in &found {
+                outln!("  {:<12} {}", installed.version, installed.path.display());
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// The settings the dashboard shows, flattened to lines here so the dashboard
+/// itself never has to know what a configuration file is.
+fn settings_lines(config: &Config, chosen: Option<&Path>) -> Vec<(String, String)> {
+    let mut lines = vec![(
+        "file".to_string(),
+        match chosen {
+            Some(path) => path.display().to_string(),
+            // Almost always the answer to "why is it not seeing my roots".
+            None => "none found — every default is in force".to_string(),
+        },
+    )];
+
+    lines.push((
+        "project.roots".to_string(),
+        config
+            .project
+            .roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    ));
+    lines.push(("scan.workers".to_string(), config.scan.workers.to_string()));
+    lines.push((
+        "docker.endpoint".to_string(),
+        config.docker.endpoint.clone(),
+    ));
+    lines.push((
+        "caddy.container".to_string(),
+        config.caddy.container.clone(),
+    ));
+
+    if config.toolchain.is_empty() {
+        lines.push((
+            "toolchain".to_string(),
+            "none — adev config --init finds what is here".to_string(),
+        ));
+    } else {
+        let mut tools: Vec<&String> = config.toolchain.keys().collect();
+        tools.sort();
+        for tool in tools {
+            let found = toolchain::discover(&config.toolchain[tool]);
+            // The count is the point: a path that turns out to hold nothing
+            // looks identical to one that was never set until you see a zero.
+            lines.push((
+                format!("toolchain.{tool}"),
+                format!(
+                    "{} installed · {}",
+                    found.len(),
+                    config.toolchain[tool]
+                        .search
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+    }
+    lines
 }
