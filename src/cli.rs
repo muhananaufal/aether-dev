@@ -58,18 +58,45 @@ pub enum Command {
     /// that has never been created has no container to start, and is reported
     /// as such rather than silently skipped.
     Start {
-        #[arg(required = true)]
+        #[arg(required_unless_present = "all")]
         services: Vec<String>,
+        /// Every service that has a container, rather than naming them.
+        #[arg(long)]
+        all: bool,
     },
     /// Stop running services, leaving their containers in place.
     Stop {
-        #[arg(required = true)]
+        #[arg(required_unless_present = "all")]
         services: Vec<String>,
+        #[arg(long)]
+        all: bool,
     },
     /// Restart services.
     Restart {
-        #[arg(required = true)]
+        #[arg(required_unless_present = "all")]
         services: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show which .env a project is running with, or switch it.
+    Dotenv {
+        project: String,
+        /// The file to copy over .env. The one being replaced is kept as
+        /// .env.bak, so a switch can be undone.
+        #[arg(long = "use", value_name = "FILE")]
+        use_file: Option<String>,
+    },
+    /// Open a service or a project in a browser.
+    Open {
+        /// A service name, or a project name — services are looked at first.
+        target: String,
+    },
+    /// End whatever is holding a port.
+    Kill {
+        port: u16,
+        /// Say what would be ended, without ending it.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Follow what a service is writing.
     Logs {
@@ -385,19 +412,22 @@ mod tests {
         assert_eq!(
             Cli::parse_from(["adev", "start", "mysql", "postgres"]).command,
             Command::Start {
-                services: vec!["mysql".to_string(), "postgres".to_string()]
+                services: vec!["mysql".to_string(), "postgres".to_string()],
+                all: false,
             }
         );
         assert_eq!(
             Cli::parse_from(["adev", "stop", "mysql"]).command,
             Command::Stop {
-                services: vec!["mysql".to_string()]
+                services: vec!["mysql".to_string()],
+                all: false,
             }
         );
         assert_eq!(
             Cli::parse_from(["adev", "restart", "caddy"]).command,
             Command::Restart {
-                services: vec!["caddy".to_string()]
+                services: vec!["caddy".to_string()],
+                all: false,
             }
         );
     }
@@ -516,6 +546,80 @@ mod tests {
         assert!(
             Cli::try_parse_from(["adev", "run"]).is_err(),
             "there is no sensible project to start when none was named"
+        );
+    }
+
+    #[test]
+    fn freeing_a_port_names_the_port_and_can_be_asked_first() {
+        assert_eq!(
+            Cli::parse_from(["adev", "kill", "8000"]).command,
+            Command::Kill {
+                port: 8000,
+                dry_run: false,
+            }
+        );
+        assert!(matches!(
+            Cli::parse_from(["adev", "kill", "8000", "--dry-run"]).command,
+            Command::Kill { dry_run: true, .. }
+        ));
+        assert!(
+            Cli::try_parse_from(["adev", "kill"]).is_err(),
+            "killing whatever happens to be listening is not a default"
+        );
+        assert!(
+            Cli::try_parse_from(["adev", "kill", "not-a-port"]).is_err(),
+            "a port is a number, and refusing early beats failing later"
+        );
+    }
+
+    #[test]
+    fn every_service_can_be_acted_on_at_once_but_only_when_asked() {
+        assert_eq!(
+            Cli::parse_from(["adev", "stop", "--all"]).command,
+            Command::Stop {
+                services: vec![],
+                all: true,
+            }
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "start", "mysql"]).command,
+            Command::Start {
+                services: vec!["mysql".to_string()],
+                all: false,
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["adev", "stop"]).is_err(),
+            "stopping everything because nothing was named is not a plausible intent"
+        );
+    }
+
+    #[test]
+    fn opening_something_in_a_browser_names_what_to_open() {
+        assert_eq!(
+            Cli::parse_from(["adev", "open", "dbgate"]).command,
+            Command::Open {
+                target: "dbgate".to_string()
+            }
+        );
+        assert!(Cli::try_parse_from(["adev", "open"]).is_err());
+    }
+
+    #[test]
+    fn the_env_file_in_use_can_be_listed_or_swapped() {
+        assert_eq!(
+            Cli::parse_from(["adev", "dotenv", "old-billing"]).command,
+            Command::Dotenv {
+                project: "old-billing".to_string(),
+                use_file: None,
+            }
+        );
+        assert_eq!(
+            Cli::parse_from(["adev", "dotenv", "old-billing", "--use", ".env.staging"]).command,
+            Command::Dotenv {
+                project: "old-billing".to_string(),
+                use_file: Some(".env.staging".to_string()),
+            }
         );
     }
 }
