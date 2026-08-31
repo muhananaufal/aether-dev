@@ -67,6 +67,32 @@ adev shell <project> [--shell <s>]    a shell with those in front on PATH
 adev tui                              the dashboard
 ```
 
+
+## The dashboard
+
+`adev tui` shows all three lists at once rather than one tab at a time — the
+question "is the database up" should not need a keystroke to answer.
+
+```
+┌ 1 Projects ─────────────────────────────┬ 2 Services ──────────────┐
+│ PROJECT          FRAMEWORK      BRANCH  │ SERVICE      PORT  STATE  │
+│ altrms           Laravel 9.52   fix/…   │ mysql        3306  ready  │
+│ manunggal-queue  Laravel 11.54  featu…  │ redis        6379  stopped│
+│ …                                       ├ 3 Ports ─────────────────┤
+│                                         │ 3306  mysql   answering   │
+└ 8 of 34 examined ───────────────────────┴ 3 of 5 answering ─────────┘
+ 8 projects of 34 directories · 3 ready of 5 services
+```
+
+`tab` moves the focus, `1`–`3` jump straight to a pane, `j`/`k` move within
+whichever pane has it, `r` refreshes, `q` quits. Each pane keeps its own row,
+so coming back to a list finds it where you left it.
+
+The focused pane is the one with a lit border and a reversed row; the others
+keep a quieter marker so you can still see where you were. Colour carries the
+same distinction the words do — green for ready, yellow for starting, grey for
+stopped, and modified files told apart from untracked ones. Each frame shows
+its own count, and a scrollbar appears only when a list is longer than fits.
 ## Toolchain versions
 
 Nothing is discovered by convention: you say where your versions live, and a

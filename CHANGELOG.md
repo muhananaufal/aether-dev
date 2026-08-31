@@ -18,13 +18,19 @@ silently, is the failure this exists to prevent.
 
 ### Dashboard
 
-- The dashboard is drawn with real widgets rather than a block of text: a tab
-  strip, a bordered table with a header, colour that carries the same
-  distinction the words do, a highlighted current row, and a scrollbar that
-  only appears when the list is longer than the screen.
+- All three lists are on screen at once rather than one tab at a time. The
+  question "is the database up" should not need a keystroke to answer. `tab`
+  and `1`-`3` move the focus; each pane keeps its own row, so coming back to a
+  list finds it where you left it.
+- Below 100 columns the focused pane takes the whole screen instead: three
+  panes on a narrow terminal are three unreadable columns.
+- Drawn with real widgets — bordered frames, a header row, a lit border on the
+  focused pane, colour carrying the same distinction the words do, per-pane
+  counts, and a scrollbar only when a list is longer than fits.
 - Its tests render into an in-memory terminal and assert on the cells, so they
-  still check what a user would see - including that a ready service is not
-  drawn like a stopped one.
+  check what a user would see: that an unreachable daemon does not report
+  "0 of 0 ready", that the focused pane looks focused, and that a ready
+  service is not coloured like a stopped one.
 
 ### Also
 
