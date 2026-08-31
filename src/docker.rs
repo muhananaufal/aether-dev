@@ -325,6 +325,28 @@ impl HttpDockerClient {
         }
     }
 
+    /// Puts a tar archive into a directory inside a container.
+    ///
+    /// This is how a file gets in without a two-way connection: a plain HTTP
+    /// client cannot write to an exec's stdin, but it can hand the daemon an
+    /// archive to unpack.
+    pub fn upload(
+        &self,
+        container: &str,
+        directory: &str,
+        archive: &[u8],
+    ) -> Result<(), DockerError> {
+        let url = format!(
+            "{}/containers/{container}/archive?path={directory}",
+            self.base
+        );
+        ureq::put(&url)
+            .content_type("application/x-tar")
+            .send(archive)
+            .map_err(|error| self.unreachable(error.to_string()))?;
+        Ok(())
+    }
+
     pub fn inspect(&self, container: &str) -> Result<ContainerDetail, DockerError> {
         let url = format!("{}/containers/{container}/json", self.base);
         let body = ureq::get(&url)
