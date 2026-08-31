@@ -1,15 +1,37 @@
 //! The dashboard.
 //!
-//! State and drawing are separated on purpose. Everything on `Dashboard` is
-//! plain data with no terminal involved, which is what makes a terminal UI
-//! testable at all; the ratatui loop around it only pushes keys in and takes a
-//! rendered screen out.
+//! State and drawing are separated on purpose. Everything the dashboard knows
+//! is plain data; the ratatui layer below only turns it into cells and pushes
+//! keys back in.
 //!
-//! The rule the predecessor broke is enforced by shape here: updates arrive as
+//! The rule the predecessor broke is enforced by shape: updates arrive as
 //! messages from collectors running elsewhere, and drawing never waits on one.
 
-use crate::domain::{Project, ServiceStatus};
+use crate::domain::{Project, ServiceState, ServiceStatus};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{
+    Block, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+    TableState, Tabs,
+};
+use ratatui::Frame;
 use std::path::PathBuf;
+
+/// One palette, named by meaning rather than by colour, so a row and the
+/// summary line below it cannot disagree about what "ready" looks like.
+mod paint {
+    use ratatui::style::Color;
+
+    pub const FRAME: Color = Color::DarkGray;
+    pub const HEADING: Color = Color::Cyan;
+    pub const MUTED: Color = Color::DarkGray;
+    pub const GOOD: Color = Color::Green;
+    pub const WAITING: Color = Color::Yellow;
+    pub const BAD: Color = Color::Red;
+    pub const CHANGED: Color = Color::Yellow;
+    pub const UNTRACKED: Color = Color::Blue;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -19,11 +41,21 @@ pub enum Tab {
 }
 
 impl Tab {
+    const ALL: [Tab; 3] = [Tab::Projects, Tab::Services, Tab::Ports];
+
     fn label(self) -> &'static str {
         match self {
             Tab::Projects => "Projects",
             Tab::Services => "Services",
             Tab::Ports => "Ports",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Tab::Projects => 0,
+            Tab::Services => 1,
+            Tab::Ports => 2,
         }
     }
 
@@ -55,6 +87,9 @@ pub struct Dashboard {
     services_error: Option<String>,
     tab: Tab,
     selected: usize,
+    /// Held rather than rebuilt each frame so the list keeps its scroll
+    /// position instead of jumping back whenever the selection moves.
+    table: TableState,
 }
 
 impl Default for Dashboard {
@@ -73,6 +108,7 @@ impl Dashboard {
             services_error: None,
             tab: Tab::Projects,
             selected: 0,
+            table: TableState::default(),
         }
     }
 
@@ -111,15 +147,15 @@ impl Dashboard {
     }
 
     pub fn next_tab(&mut self) {
-        self.tab = self.tab.next();
-        // A row number taken from a longer list would point past the end of a
-        // shorter one, so it does not survive the move.
-        self.selected = 0;
+        self.set_tab(self.tab.next());
     }
 
     pub fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
+        // A row number taken from a longer list would point past the end of a
+        // shorter one, so it does not survive the move.
         self.selected = 0;
+        self.table = TableState::default();
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -132,159 +168,297 @@ impl Dashboard {
         match self.tab {
             Tab::Projects => self.projects.len(),
             Tab::Services => self.services.len(),
-            Tab::Ports => self.services.iter().filter(|s| s.port.is_some()).count(),
+            Tab::Ports => self.published().count(),
         }
     }
 
-    fn rows(&self) -> Vec<String> {
-        match self.tab {
-            Tab::Projects => self
-                .projects
-                .iter()
-                .map(|project| {
-                    format!(
-                        "{:<28} {:<12} {:<18} {:<20} {}",
-                        clip(&project.name, 28),
-                        clip(project.category.as_deref().unwrap_or("-"), 12),
-                        clip(
-                            &project
-                                .framework
-                                .clone()
-                                .unwrap_or_else(|| format!("{:?}", project.stack)),
-                            18,
-                        ),
-                        clip(project.git.branch.as_deref().unwrap_or("-"), 20),
-                        project.git.badge()
-                    )
-                })
-                .collect(),
-            Tab::Services => self
-                .services
-                .iter()
-                .map(|service| {
-                    format!(
-                        "{:<18} {:<24} {:<7} {}",
-                        clip(&service.service, 18),
-                        clip(&service.container, 24),
+    fn published(&self) -> impl Iterator<Item = &ServiceStatus> {
+        self.services.iter().filter(|s| s.port.is_some())
+    }
+
+    /// Draws the whole screen: a tab strip, the list, and one line saying what
+    /// the numbers add up to.
+    pub fn draw(&mut self, frame: &mut Frame) {
+        let [top, middle, bottom] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        let [status, keys] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(46)]).areas(bottom);
+
+        frame.render_widget(self.tab_strip(), top);
+        self.draw_list(frame, middle);
+        frame.render_widget(self.status_line(), status);
+        frame.render_widget(key_hints(), keys);
+    }
+
+    fn tab_strip(&self) -> Tabs<'_> {
+        Tabs::new(Tab::ALL.map(Tab::label).to_vec())
+            .select(self.tab.index())
+            .style(Style::default().fg(paint::MUTED))
+            .highlight_style(
+                Style::default()
+                    .fg(paint::HEADING)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .divider(Span::styled("·", Style::default().fg(paint::FRAME)))
+    }
+
+    fn draw_list(&mut self, frame: &mut Frame, area: Rect) {
+        self.table.select(Some(self.selected));
+
+        // Columns are per tab rather than padded to a common shape: a fixed
+        // arity meant carrying empty columns, and empty columns took the width
+        // that the branch names needed.
+        let (header, widths, rows): (Vec<&str>, Vec<Constraint>, Vec<Row<'static>>) = match self.tab
+        {
+            Tab::Projects => (
+                vec!["PROJECT", "GROUP", "FRAMEWORK", "BRANCH", "CHANGES"],
+                vec![
+                    Constraint::Fill(3),
+                    Constraint::Length(12),
+                    Constraint::Length(17),
+                    Constraint::Fill(3),
+                    Constraint::Length(10),
+                ],
+                self.project_rows(),
+            ),
+            Tab::Services => (
+                vec!["SERVICE", "CONTAINER", "PORT", "STATE"],
+                vec![
+                    Constraint::Length(18),
+                    Constraint::Fill(1),
+                    Constraint::Length(7),
+                    Constraint::Length(9),
+                ],
+                self.service_rows(),
+            ),
+            Tab::Ports => (
+                vec!["PORT", "SERVICE", "ANSWERS"],
+                vec![
+                    Constraint::Length(7),
+                    Constraint::Length(26),
+                    Constraint::Fill(1),
+                ],
+                self.port_rows(),
+            ),
+        };
+
+        let table = Table::new(rows, widths)
+            .header(
+                Row::new(header).style(
+                    Style::default()
+                        .fg(paint::MUTED)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .block(
+                Block::bordered()
+                    .border_style(Style::default().fg(paint::FRAME))
+                    .padding(Padding::horizontal(1))
+                    .title(Span::styled(
+                        format!(" {} ", self.tab.label()),
+                        Style::default()
+                            .fg(paint::HEADING)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .column_spacing(2)
+            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+        frame.render_stateful_widget(table, area, &mut self.table);
+
+        // Only when there is more than fits: a scrollbar on a list that is
+        // entirely visible tells the reader nothing and takes a column doing it.
+        let rows = self.row_count();
+        let visible = usize::from(area.height.saturating_sub(3));
+        if rows > visible && visible > 0 {
+            let mut position = ScrollbarState::new(rows).position(self.selected);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    // Matching the border so the bar reads as part of the frame
+                    // rather than as a second one drawn on top of it.
+                    .track_symbol(Some("│"))
+                    .track_style(Style::default().fg(paint::FRAME))
+                    .thumb_style(Style::default().fg(paint::HEADING)),
+                area.inner(Margin {
+                    vertical: 1,
+                    horizontal: 0,
+                }),
+                &mut position,
+            );
+        }
+    }
+
+    fn project_rows(&self) -> Vec<Row<'static>> {
+        self.projects
+            .iter()
+            .map(|project| {
+                let framework = project
+                    .framework
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?}", project.stack));
+                Row::new(vec![
+                    Cell::from(project.name.clone()),
+                    Cell::from(project.category.clone().unwrap_or_else(|| "-".into()))
+                        .style(Style::default().fg(paint::MUTED)),
+                    Cell::from(framework).style(Style::default().fg(paint::HEADING)),
+                    Cell::from(project.git.branch.clone().unwrap_or_else(|| "-".into())),
+                    Cell::from(changes(&project.git)),
+                ])
+            })
+            .collect()
+    }
+
+    fn service_rows(&self) -> Vec<Row<'static>> {
+        self.services
+            .iter()
+            .map(|service| {
+                Row::new(vec![
+                    Cell::from(service.service.clone()),
+                    Cell::from(service.container.clone()).style(Style::default().fg(paint::MUTED)),
+                    Cell::from(
                         service
                             .port
                             .map_or_else(|| "-".to_string(), |port| port.to_string()),
-                        service.condition()
-                    )
-                })
-                .collect(),
-            Tab::Ports => self
-                .services
-                .iter()
-                .filter(|service| service.port.is_some())
-                .map(|service| {
-                    format!(
-                        "{:>6}  {:<18} {}",
-                        service.port.unwrap_or_default(),
-                        clip(&service.service, 18),
-                        if service.port_open {
-                            "answering"
-                        } else {
-                            "no answer"
-                        }
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    fn header(&self) -> String {
-        let tabs: Vec<String> = [Tab::Projects, Tab::Services, Tab::Ports]
-            .iter()
-            .map(|tab| {
-                if *tab == self.tab {
-                    format!("[{}]", tab.label())
-                } else {
-                    format!(" {} ", tab.label())
-                }
+                    ),
+                    Cell::from(service.condition()).style(condition_style(service)),
+                    Cell::from(""),
+                ])
             })
-            .collect();
-        format!(
-            "aether-dev {}  tab switch  j/k move  r refresh  q quit",
-            tabs.join(" ")
-        )
+            .collect()
     }
 
-    fn summary(&self) -> String {
-        match self.tab {
+    fn port_rows(&self) -> Vec<Row<'static>> {
+        self.published()
+            .map(|service| {
+                let (answer, style) = if service.port_open {
+                    ("answering", Style::default().fg(paint::GOOD))
+                } else {
+                    ("no answer", Style::default().fg(paint::BAD))
+                };
+                Row::new(vec![
+                    Cell::from(service.port.unwrap_or_default().to_string()),
+                    Cell::from(service.service.clone()),
+                    Cell::from(answer).style(style),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+            })
+            .collect()
+    }
+
+    fn status_line(&self) -> Paragraph<'_> {
+        let dim = Style::default().fg(paint::MUTED);
+        let spans = match self.tab {
             Tab::Projects => {
                 let examined = match self.scanned {
                     // The denominator is part of the answer: "no projects" and
                     // "nothing was examined" are different facts.
                     Some(count) => format!("{count} directories examined"),
-                    None => "scanning...".to_string(),
+                    None => "scanning…".to_string(),
                 };
-                format!(
-                    "{} projects, {} unreadable, {examined}",
-                    self.projects.len(),
-                    self.scan_failures.len()
-                )
+                let mut spans = vec![
+                    Span::styled(
+                        format!(" {} projects", self.projects.len()),
+                        Style::default().fg(paint::GOOD),
+                    ),
+                    Span::styled(format!(" · {examined}"), dim),
+                ];
+                if !self.scan_failures.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" · {} unreadable", self.scan_failures.len()),
+                        Style::default().fg(paint::BAD),
+                    ));
+                }
+                spans
             }
             Tab::Services | Tab::Ports => match &self.services_error {
                 // An unreachable daemon must not read as a daemon with nothing
                 // running, so the count is replaced rather than shown as zero.
-                Some(reason) => format!("docker unreachable: {reason}"),
+                Some(reason) => vec![Span::styled(
+                    format!(" docker unreachable: {reason}"),
+                    Style::default().fg(paint::BAD),
+                )],
                 None if self.tab == Tab::Services => {
                     let ready = self.services.iter().filter(|s| s.is_reachable()).count();
-                    format!("{} services, {ready} ready", self.services.len())
+                    vec![
+                        Span::styled(format!(" {ready} ready"), Style::default().fg(paint::GOOD)),
+                        Span::styled(format!(" · {} services", self.services.len()), dim),
+                    ]
                 }
                 None => {
-                    let published: Vec<&ServiceStatus> =
-                        self.services.iter().filter(|s| s.port.is_some()).collect();
+                    let published: Vec<&ServiceStatus> = self.published().collect();
                     let answering = published.iter().filter(|s| s.port_open).count();
-                    format!("{} published ports, {answering} answering", published.len())
+                    vec![
+                        Span::styled(
+                            format!(" {answering} answering"),
+                            Style::default().fg(paint::GOOD),
+                        ),
+                        Span::styled(format!(" · {} published", published.len()), dim),
+                    ]
                 }
             },
-        }
-    }
+        };
 
-    /// Draws the whole screen as text. Returning a string rather than painting
-    /// widgets directly is what lets the tests assert on what a user sees.
-    pub fn render(&self, width: u16, height: u16) -> String {
-        let width = (width as usize).max(20);
-        let height = (height as usize).max(6);
-        let capacity = height - 4;
-
-        let mut lines = Vec::with_capacity(height);
-        lines.push(clip(&self.header(), width));
-        lines.push("-".repeat(width));
-
-        let rows = self.rows();
-        // Scroll only as far as needed to keep the current row on screen.
-        let offset = self.selected.saturating_sub(capacity.saturating_sub(1));
-        for (index, row) in rows.iter().enumerate().skip(offset).take(capacity) {
-            let marker = if index == self.selected { '>' } else { ' ' };
-            lines.push(format!("{marker}{}", clip(row, width - 1)));
-        }
-        while lines.len() < height - 2 {
-            lines.push(String::new());
-        }
-
-        lines.push("-".repeat(width));
-        lines.push(clip(&self.summary(), width));
-        lines.truncate(height);
-        lines.join("\n")
+        Paragraph::new(Line::from(spans))
     }
 }
 
-fn clip(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        text.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+/// Tracked changes and untracked files, coloured apart because they mean
+/// different things: one is work in progress, the other is work not yet known
+/// to git at all.
+fn changes(git: &crate::domain::GitStatus) -> Line<'static> {
+    let mut spans = Vec::new();
+    if git.modified > 0 {
+        spans.push(Span::styled(
+            format!("*{}", git.modified),
+            Style::default().fg(paint::CHANGED),
+        ));
     }
+    if git.untracked > 0 {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            format!("?{}", git.untracked),
+            Style::default().fg(paint::UNTRACKED),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn condition_style(service: &ServiceStatus) -> Style {
+    match (service.state, service.port_open) {
+        (ServiceState::Running, true) => Style::default()
+            .fg(paint::GOOD)
+            .add_modifier(Modifier::BOLD),
+        (ServiceState::Running, false) => Style::default().fg(paint::WAITING),
+        (ServiceState::Stopped, _) => Style::default().fg(paint::MUTED),
+    }
+}
+
+/// The keys, kept to the right so the numbers on the left are read first.
+fn key_hints() -> Paragraph<'static> {
+    Paragraph::new(Line::from(Span::styled(
+        "tab/1-3 switch · j/k move · r refresh · q quit ",
+        Style::default().fg(paint::FRAME),
+    )))
+    .alignment(Alignment::Right)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{GitStatus, ServiceState, ServiceStatus, Stack};
-    use std::path::PathBuf;
+    use crate::domain::{GitStatus, Stack};
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
 
     fn project(name: &str) -> Project {
         Project {
@@ -315,6 +489,37 @@ mod tests {
         }
         dashboard.apply(Update::ScanFinished { scanned: count });
         dashboard
+    }
+
+    /// Draws onto a terminal that only exists in memory, so the tests can
+    /// assert on what a user would actually see rather than on internals.
+    fn drawn(dashboard: &mut Dashboard, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| dashboard.draw(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn lines(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn screen(buffer: &Buffer) -> String {
+        lines(buffer).join("\n")
+    }
+
+    /// The style of the row whose text contains `needle`, taken from a cell
+    /// well inside it so the border is not what gets measured.
+    fn row_style(buffer: &Buffer, needle: &str) -> Option<Style> {
+        lines(buffer)
+            .iter()
+            .position(|line| line.contains(needle))
+            .map(|y| buffer[(2, y as u16)].style())
     }
 
     #[test]
@@ -403,7 +608,7 @@ mod tests {
         let mut dashboard = Dashboard::new();
         dashboard.apply(Update::ServicesFailed("connection refused".to_string()));
         dashboard.next_tab();
-        let view = dashboard.render(90, 24);
+        let view = screen(&drawn(&mut dashboard, 90, 12));
         assert!(
             view.contains("connection refused"),
             "the reason must reach the screen"
@@ -416,34 +621,107 @@ mod tests {
 
     #[test]
     fn the_view_reports_the_denominator_not_only_the_findings() {
-        let dashboard = with_projects(0);
-        let view = dashboard.render(90, 24);
+        let mut dashboard = with_projects(0);
+        let view = screen(&drawn(&mut dashboard, 90, 12));
         assert!(
-            view.contains('0') && view.contains("examined"),
+            view.contains("0 projects") && view.contains("examined"),
             "'no projects' and 'nothing was examined' must not read the same"
         );
     }
 
     #[test]
-    fn the_selected_row_is_marked_in_the_view() {
+    fn the_current_row_is_drawn_differently_from_the_others() {
         let mut dashboard = with_projects(3);
         dashboard.move_selection(1);
-        let marked: Vec<&str> = dashboard
-            .render(90, 24)
-            .lines()
-            .filter(|line| line.starts_with('>'))
-            .map(|_| "marked")
-            .collect();
-        assert_eq!(marked.len(), 1, "exactly one row is the current one");
+        let buffer = drawn(&mut dashboard, 90, 12);
+
+        let current = row_style(&buffer, "p1").expect("the selected row is on screen");
+        let other = row_style(&buffer, "p2").expect("another row is on screen");
+        assert_ne!(
+            current, other,
+            "a list where the current row looks like every other row cannot be navigated"
+        );
     }
 
     #[test]
-    fn the_view_never_draws_more_rows_than_the_terminal_has_lines() {
-        let dashboard = with_projects(200);
-        let view = dashboard.render(90, 20);
+    fn a_long_list_scrolls_to_keep_the_current_row_on_screen() {
+        let mut dashboard = with_projects(200);
+        dashboard.move_selection(150);
+        let view = screen(&drawn(&mut dashboard, 90, 12));
         assert!(
-            view.lines().count() <= 20,
-            "drawing past the last line pushes the header off the screen"
+            view.contains("p150"),
+            "a selection the list has scrolled past is a selection nobody can see"
+        );
+    }
+
+    #[test]
+    fn a_service_that_is_ready_is_not_drawn_like_one_that_is_stopped() {
+        let mut dashboard = Dashboard::new();
+        let mut stopped = service("redis", 6379, false);
+        stopped.state = ServiceState::Stopped;
+        dashboard.apply(Update::Services(vec![
+            service("mysql", 3306, true),
+            stopped,
+        ]));
+        dashboard.next_tab();
+        let buffer = drawn(&mut dashboard, 90, 12);
+        let view = screen(&buffer);
+
+        assert!(view.contains("ready") && view.contains("stopped"));
+        // Colour carries the same distinction the word does, so the state can
+        // be read at a glance rather than word by word.
+        let ready_row = lines(&buffer)
+            .iter()
+            .position(|line| line.contains("mysql"))
+            .expect("mysql row");
+        let stopped_row = lines(&buffer)
+            .iter()
+            .position(|line| line.contains("redis"))
+            .expect("redis row");
+        let rows = lines(&buffer);
+        let ready_at = rows[ready_row].find("ready").expect("the word ready") as u16;
+        let stopped_at = rows[stopped_row].find("stopped").expect("the word stopped") as u16;
+        assert_ne!(
+            buffer[(ready_at, ready_row as u16)].style().fg,
+            buffer[(stopped_at, stopped_row as u16)].style().fg
+        );
+    }
+
+    #[test]
+    fn the_tab_you_are_on_is_marked_in_the_strip() {
+        let mut dashboard = Dashboard::new();
+        let buffer = drawn(&mut dashboard, 90, 12);
+        let strip = lines(&buffer)[0].clone();
+        assert!(strip.contains("Projects") && strip.contains("Services"));
+
+        let projects_at = strip.find("Projects").expect("Projects in the strip") as u16;
+        let services_at = strip.find("Services").expect("Services in the strip") as u16;
+        assert_ne!(
+            buffer[(projects_at, 0)].style(),
+            buffer[(services_at, 0)].style(),
+            "if every tab looks the same, the strip does not say where you are"
+        );
+    }
+
+    #[test]
+    fn the_frame_carries_the_name_of_the_list_being_shown() {
+        let mut dashboard = with_projects(1);
+        assert!(screen(&drawn(&mut dashboard, 90, 12)).contains("Projects"));
+        dashboard.next_tab();
+        assert!(screen(&drawn(&mut dashboard, 90, 12)).contains("Services"));
+    }
+
+    #[test]
+    fn a_list_that_fits_gets_no_scrollbar_and_a_longer_one_does() {
+        let mut fits = with_projects(3);
+        let mut overflows = with_projects(200);
+        assert!(
+            !screen(&drawn(&mut fits, 90, 12)).contains('█'),
+            "a scrollbar on a list you can see all of takes a column and says nothing"
+        );
+        assert!(
+            screen(&drawn(&mut overflows, 90, 12)).contains('█'),
+            "without it there is no way to tell where in 200 rows you are"
         );
     }
 }

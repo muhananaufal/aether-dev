@@ -16,6 +16,16 @@ is chosen: running a legacy project on an interpreter it said it cannot use,
 silently, is the failure this exists to prevent.
 
 
+### Dashboard
+
+- The dashboard is drawn with real widgets rather than a block of text: a tab
+  strip, a bordered table with a header, colour that carries the same
+  distinction the words do, a highlighted current row, and a scrollbar that
+  only appears when the list is longer than the screen.
+- Its tests render into an in-memory terminal and assert on the cells, so they
+  still check what a user would see - including that a ready service is not
+  drawn like a stopped one.
+
 ### Also
 
 - The configuration file is found rather than named: `aether.toml` in the
