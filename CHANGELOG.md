@@ -16,6 +16,13 @@ is chosen: running a legacy project on an interpreter it said it cannot use,
 silently, is the failure this exists to prevent.
 
 
+### Also
+
+- The configuration file is found rather than named: `aether.toml` in the
+  current directory or any parent, then the machine-wide one. Passing
+  `--config` on every command is the kind of friction that stops a tool being
+  used at all.
+
 ## 0.1.0 — unreleased
 
 First release. Replaces a 4,300-line PowerShell script that drove a WinForms
@@ -50,3 +57,4 @@ window on one machine.
 - The name `localhost` is pinned to IPv4 when reaching Docker. On Windows it
   otherwise resolves to `::1` first and every request pays for a connection
   that cannot succeed: 2.45s against 0.72s for a listing.
+

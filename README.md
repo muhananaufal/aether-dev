@@ -19,6 +19,34 @@ or a scheduler.
 machine, but it has run on exactly one setup so far — Windows with Docker
 inside WSL. Expect the rough edges of a tool that has met one environment.**
 
+## Installing
+
+```
+cargo install --path .
+```
+
+That puts `adev` in `~/.cargo/bin`, which is already on PATH if you have Rust.
+To run it without installing, build with `cargo build --release` and call
+`target/release/adev` directly.
+
+## Configuring
+
+`adev` looks for `aether.toml` in the current directory and then each parent,
+so running it inside a project still finds the configuration above the whole
+workspace — and one project can override it by keeping its own. Failing all of
+those it reads the machine-wide file:
+
+- Windows: `%APPDATA%\aether-dev\aether.toml`
+- Linux and macOS: `$XDG_CONFIG_HOME/aether-dev/aether.toml`, or
+  `~/.config/aether-dev/aether.toml`
+
+`--config <file>` overrides all of it. Everything has a working default, so a
+configuration file only needs the parts you want to change. Start from
+[aether.example.toml](aether.example.toml).
+
+Paths inside the file resolve against the directory you run from, not against
+the file. That matters for `caddyfile` and `domains`, which are written to.
+
 ## Commands
 
 ```
@@ -84,9 +112,6 @@ PHP 8.3.33 (cli) ...
 
 The toolchain goes in front of the existing PATH rather than replacing it: a
 project needs its own PHP, and it still needs git.
-
-`--config <file>` selects a configuration file; without one the defaults
-apply. Paths inside the configuration resolve against the current directory.
 
 ## Why it exists
 
