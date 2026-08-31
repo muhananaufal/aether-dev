@@ -3,15 +3,19 @@
 use aether_dev::cli::{Cli, Command};
 use aether_dev::config::Config;
 use aether_dev::docker::{probe_all, DockerClient, HttpDockerClient};
-use aether_dev::domain::{Project, ServiceState, ServiceStatus};
+use aether_dev::domain::{Project, ServiceStatus};
 use aether_dev::git::GitCli;
+use aether_dev::ports::ScanEvent;
 use aether_dev::ports::{collect, ProjectScanner};
 use aether_dev::scan::FsProjectScanner;
+use aether_dev::tui::{Dashboard, Tab, Update};
 use clap::Parser;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use serde::Serialize;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 /// Prints a line, treating a reader that walked away the way every other
@@ -45,7 +49,7 @@ fn main() -> ExitCode {
         Command::Ports { json } => ports(&config, json),
         Command::Db(_) => not_built_yet("db"),
         Command::Domains(_) => not_built_yet("domains"),
-        Command::Tui => not_built_yet("tui"),
+        Command::Tui => tui(&config),
     }
 }
 
@@ -168,17 +172,6 @@ fn load_services(config: &Config) -> Result<Vec<ServiceStatus>, ExitCode> {
     Ok(services)
 }
 
-/// One word for what a service is actually doing. "running" and "usable" are
-/// deliberately not the same word.
-fn condition(service: &ServiceStatus) -> &'static str {
-    match (service.state, service.port_open, service.port.is_some()) {
-        (ServiceState::Stopped, _, _) => "stopped",
-        (ServiceState::Running, true, _) => "ready",
-        (ServiceState::Running, false, true) => "starting",
-        (ServiceState::Running, false, false) => "running",
-    }
-}
-
 fn services(config: &Config, json: bool) -> ExitCode {
     let services = match load_services(config) {
         Ok(services) => services,
@@ -206,7 +199,7 @@ fn services(config: &Config, json: bool) -> ExitCode {
             service
                 .port
                 .map_or_else(|| "-".to_string(), |p| p.to_string()),
-            condition(service)
+            service.condition()
         );
     }
     let ready = services.iter().filter(|s| s.is_reachable()).count();
@@ -252,4 +245,106 @@ fn ports(config: &Config, json: bool) -> ExitCode {
         published.len()
     );
     ExitCode::SUCCESS
+}
+
+/// Starts every collector on its own thread and returns at once. Nothing here
+/// waits: results reach the dashboard as messages, which is the arrangement
+/// that keeps the screen answering while work is still running.
+fn spawn_collectors(config: &Config, updates: Sender<Update>) {
+    let project_config = config.project.clone();
+    let workers = config.scan.workers;
+    let git_timeout = config.scan.git_timeout_ms;
+    let scan_updates = updates.clone();
+    std::thread::spawn(move || {
+        let scanner = FsProjectScanner::new(GitCli::new(git_timeout), workers);
+        let (found, results) = mpsc::channel();
+        std::thread::spawn(move || scanner.scan(&project_config, found));
+        for event in results {
+            let update = match event {
+                ScanEvent::Found(project) => Update::Project(project),
+                ScanEvent::Failed { path, reason } => Update::ScanFailed { path, reason },
+                ScanEvent::Finished { scanned } => Update::ScanFinished { scanned },
+            };
+            if scan_updates.send(update).is_err() {
+                break;
+            }
+        }
+    });
+
+    let endpoint = config.docker.endpoint.clone();
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    std::thread::spawn(move || {
+        let outcome = HttpDockerClient::new(&endpoint, docker_host.as_deref())
+            .and_then(|client| client.services());
+        let update = match outcome {
+            Ok(mut services) => {
+                probe_all(&mut services, PORT_PROBE);
+                services.sort_by(|a, b| a.service.cmp(&b.service));
+                Update::Services(services)
+            }
+            Err(error) => Update::ServicesFailed(error.to_string()),
+        };
+        let _ = updates.send(update);
+    });
+}
+
+fn tui(config: &Config) -> ExitCode {
+    let mut dashboard = Dashboard::new();
+    let (updates, incoming) = mpsc::channel();
+    spawn_collectors(config, updates.clone());
+
+    let outcome: std::io::Result<()> = ratatui::run(|terminal| {
+        loop {
+            // Take whatever has arrived and move on. Blocking here to wait for
+            // a collector is exactly the mistake that froze the tool this
+            // replaces for six seconds at a time.
+            while let Ok(update) = incoming.try_recv() {
+                dashboard.apply(update);
+            }
+
+            terminal.draw(|frame| {
+                let area = frame.area();
+                let view = dashboard.render(area.width, area.height);
+                frame.render_widget(view.as_str(), area);
+            })?;
+
+            if !event::poll(Duration::from_millis(80))? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            // Windows sends a press and a release for one keystroke, so without
+            // this filter every movement counts twice.
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                KeyCode::Tab | KeyCode::Right => dashboard.next_tab(),
+                KeyCode::Char('1') => dashboard.set_tab(Tab::Projects),
+                KeyCode::Char('2') => dashboard.set_tab(Tab::Services),
+                KeyCode::Char('3') => dashboard.set_tab(Tab::Ports),
+                KeyCode::Char('j') | KeyCode::Down => dashboard.move_selection(1),
+                KeyCode::Char('k') | KeyCode::Up => dashboard.move_selection(-1),
+                KeyCode::PageDown => dashboard.move_selection(10),
+                KeyCode::PageUp => dashboard.move_selection(-10),
+                // The new collectors report into the same channel the loop is
+                // already draining, so their results land like any other.
+                KeyCode::Char('r') => {
+                    dashboard.begin_refresh();
+                    spawn_collectors(config, updates.clone());
+                }
+                _ => {}
+            }
+        }
+    });
+
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("adev: {error}");
+            ExitCode::from(2)
+        }
+    }
 }
