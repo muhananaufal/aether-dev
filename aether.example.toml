@@ -1,0 +1,48 @@
+# Example configuration for adev. Copy it, keep only what you want to change:
+# anything left out keeps its default.
+#
+# Paths resolve against the directory you run adev from, not against this file.
+
+[project]
+# Directories that hold projects. A project is a directory containing one of
+# artisan, composer.json, package.json, go.mod, Cargo.toml or pyproject.toml.
+# Default: the current directory.
+roots = ["C:/Projects"]
+
+# How far below each root to look. A directory that is itself a project is not
+# descended into, so a project's dependencies never appear as projects.
+max_depth = 3
+
+# Never descended into.
+ignore = ["node_modules", "vendor", "target", ".git"]
+
+[scan]
+# How many repositories git is asked about at once. This is the number the
+# whole rewrite is about: the same 24 repositories took 5,983 ms one at a time.
+workers = 12
+
+# A repository slower than this is reported as unreadable rather than allowed
+# to stall the scan.
+git_timeout_ms = 2000
+
+cache_ttl_secs = 30
+
+[docker]
+# "auto" follows DOCKER_HOST, the way other docker clients do. Only tcp:// and
+# http:// endpoints work in this build; a unix socket or a named pipe is
+# reported as an unsupported transport.
+#
+# Read the note in the README before exposing a daemon over TCP: the Docker
+# API is root-equivalent and unauthenticated.
+endpoint = "auto"
+
+[caddy]
+# Restarted after a domain changes, so the proxy picks up the new config.
+container = "caddy-proxy"
+
+# Generated from the domains file. Overwritten on every change - anything
+# added here by hand is lost.
+caddyfile = "Caddyfile"
+
+# The source of truth for local hostnames. Managed with `adev domains`.
+domains = "domains.toml"
