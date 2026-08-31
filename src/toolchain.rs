@@ -181,6 +181,13 @@ pub struct ToolConfig {
     /// Where that file sits inside a version directory, when it is not at the
     /// top: Go keeps its binaries in `bin`, Node does not.
     pub bin_subdir: Option<String>,
+    /// The files whose presence means this tool applies to a project.
+    ///
+    /// Empty means "assume the obvious one" for the two ecosystems that have
+    /// an unambiguous manifest, and "only when pinned" for everything else.
+    /// Naming it here is how a Go, Python or Ruby toolchain becomes relevant
+    /// without this tool having to know the language exists.
+    pub when: Vec<String>,
     /// Versions pointed at by hand, for installs whose directory name says
     /// nothing useful.
     pub versions: HashMap<String, PathBuf>,
@@ -319,6 +326,35 @@ pub fn resolve(
             },
         },
     }
+}
+
+/// Whether a tool applies to a project holding these files, going by what the
+/// tool itself says.
+pub fn applies(tool: &ToolConfig, present: &[&str]) -> bool {
+    tool.when
+        .iter()
+        .any(|marker| present.contains(&marker.as_str()))
+}
+
+/// The same question when the tool has said nothing.
+///
+/// Two ecosystems get an assumed marker because their manifest is unambiguous
+/// and configurations written before `when` existed must keep working.
+/// Everything else applies only where it was asked for: putting a version of
+/// something on PATH because it happens to be installed would be this tool
+/// deciding for a project that never mentioned it.
+pub fn applies_named(name: &str, tool: &ToolConfig, present: &[&str]) -> bool {
+    if !tool.when.is_empty() {
+        // Somebody wrote a list. That list is the answer, not that list plus
+        // whatever would have been assumed.
+        return applies(tool, present);
+    }
+    let assumed = match name {
+        "php" => "composer.json",
+        "node" => "package.json",
+        _ => return false,
+    };
+    present.contains(&assumed)
 }
 #[cfg(test)]
 mod tests {
@@ -466,6 +502,7 @@ mod tests {
             search: vec![search.to_path_buf()],
             binary: "php.exe".to_string(),
             bin_subdir: None,
+            when: Vec::new(),
             versions: HashMap::new(),
         }
     }
@@ -513,6 +550,7 @@ mod tests {
             ],
             binary: "php.exe".to_string(),
             bin_subdir: None,
+            when: Vec::new(),
             versions: HashMap::new(),
         };
         assert!(discover(&config).is_empty());
@@ -545,6 +583,7 @@ mod tests {
             search: vec![dir.path().to_path_buf()],
             binary: "go.exe".to_string(),
             bin_subdir: Some("bin".to_string()),
+            when: Vec::new(),
             versions: HashMap::new(),
         };
         let found = discover(&config);
@@ -629,5 +668,67 @@ mod tests {
             "a caret was always allowed to move up within the major"
         );
         assert_eq!(select(&choices, ">=8.1").unwrap().label, "8.3.6");
+    }
+
+    #[test]
+    fn a_tool_says_for_itself_which_projects_it_applies_to() {
+        let go = ToolConfig {
+            search: vec![PathBuf::from("/tools/go")],
+            binary: "go".to_string(),
+            bin_subdir: Some("bin".to_string()),
+            when: vec!["go.mod".to_string()],
+            versions: HashMap::new(),
+        };
+        assert!(applies(&go, &["go.mod", "README.md"]));
+        assert!(!applies(&go, &["composer.json"]));
+    }
+
+    #[test]
+    fn php_and_node_keep_working_without_anybody_writing_when() {
+        // Configurations written before `when` existed must not quietly stop
+        // resolving, so the two ecosystems with an obvious marker keep theirs.
+        let php = ToolConfig {
+            binary: "php".to_string(),
+            search: vec![PathBuf::from("/tools/php")],
+            ..ToolConfig::default()
+        };
+        assert!(applies_named("php", &php, &["composer.json"]));
+        assert!(!applies_named("php", &php, &["package.json"]));
+
+        let node = ToolConfig {
+            binary: "node".to_string(),
+            search: vec![PathBuf::from("/tools/node")],
+            ..ToolConfig::default()
+        };
+        assert!(applies_named("node", &node, &["package.json"]));
+    }
+
+    #[test]
+    fn a_written_when_replaces_the_assumed_one_rather_than_adding_to_it() {
+        let php = ToolConfig {
+            binary: "php".to_string(),
+            search: vec![PathBuf::from("/tools/php")],
+            when: vec!["index.php".to_string()],
+            ..ToolConfig::default()
+        };
+        assert!(applies_named("php", &php, &["index.php"]));
+        assert!(
+            !applies_named("php", &php, &["composer.json"]),
+            "somebody who wrote when meant that list, not that list plus a guess"
+        );
+    }
+
+    #[test]
+    fn a_tool_nobody_gave_a_marker_applies_to_nothing_on_its_own() {
+        let odd = ToolConfig {
+            binary: "ruby".to_string(),
+            search: vec![PathBuf::from("/tools/ruby")],
+            ..ToolConfig::default()
+        };
+        assert!(
+            !applies_named("ruby", &odd, &["Gemfile"]),
+            "putting a version of something on PATH because it exists would be \
+             this tool deciding for a project that never mentioned it"
+        );
     }
 }

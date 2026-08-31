@@ -86,3 +86,14 @@ domains = "domains.toml"
 # [run.old-billing]
 # command = "php -S localhost:9000 -t public"
 # port = 9000
+
+# A toolchain applies to a project that holds one of these files. Without it,
+# php assumes composer.json and node assumes package.json, and anything else
+# applies only where a [pin] names it — so this is how Go, Python or Ruby
+# become relevant without the tool having to know the language exists.
+#
+# [toolchain.go]
+# search = ["C:/Go"]
+# binary = "go.exe"
+# bin_subdir = "bin"
+# when = ["go.mod"]
