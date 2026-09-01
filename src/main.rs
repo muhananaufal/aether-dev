@@ -3174,11 +3174,24 @@ mod tests {
     }
 
     impl Keyboard {
+        /// A dashboard wired to nothing that exists.
+        ///
+        /// The endpoint is a closed port deliberately. `auto` follows
+        /// DOCKER_HOST, and on a developer's machine that points at a real
+        /// daemon - so a test pressing x really did stop a real container on
+        /// the machine this was written on. Container state is not a thing a
+        /// test suite is allowed to have an opinion about.
         fn new() -> Self {
             let (updates, heard) = mpsc::channel();
+            let config = Config {
+                docker: aether_dev::config::DockerConfig {
+                    endpoint: "tcp://127.0.0.1:1".to_string(),
+                },
+                ..Config::default()
+            };
             Self {
                 dashboard: Dashboard::new(),
-                config: Config::default(),
+                config,
                 updates,
                 heard,
                 watching: None,
@@ -3439,6 +3452,8 @@ mod tests {
     /// those is not a test, it is a prank.
     fn harmless(directory: &Path) -> Config {
         let mut config = Config::default();
+        // Same reason as Keyboard::new: nothing in a test may reach a daemon.
+        config.docker.endpoint = "tcp://127.0.0.1:1".to_string();
         config.caddy.domains = directory.join("domains.toml");
         config.caddy.caddyfile = directory.join("Caddyfile");
         config.backup.directory = directory.join("backups");
