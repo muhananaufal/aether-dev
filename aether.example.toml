@@ -25,7 +25,6 @@ workers = 12
 # to stall the scan.
 git_timeout_ms = 2000
 
-cache_ttl_secs = 30
 
 [docker]
 # "auto" follows DOCKER_HOST, the way other docker clients do. Only tcp:// and
