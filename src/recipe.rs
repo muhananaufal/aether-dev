@@ -426,4 +426,106 @@ mod tests {
         );
         assert!(split("   ").is_empty());
     }
+
+    /// What real project directories actually look like.
+    ///
+    /// Every one of these holds the markers of two or three recipes at once,
+    /// and which one wins is decided by the order of a list nobody was
+    /// checking. A Laravel project starting `npm run dev` instead of
+    /// `php artisan serve` would be a confusing morning.
+    #[test]
+    fn a_directory_holding_several_markers_starts_as_the_thing_it_actually_is() {
+        let cases: [(&str, &[&str]); 6] = [
+            // Laravel has shipped a package.json since forever and a
+            // vite.config.js since 9.
+            (
+                "laravel",
+                &["artisan", "composer.json", "package.json", "vite.config.js"],
+            ),
+            // Django projects almost always have requirements.txt beside
+            // manage.py, and python is the last resort for that file alone.
+            ("django", &["manage.py", "requirements.txt"]),
+            // FastAPI is requirements.txt plus a main.py, which is why it is
+            // listed before plain python rather than after it.
+            ("fastapi", &["main.py", "requirements.txt"]),
+            ("python", &["requirements.txt"]),
+            // A Go service with a javascript front end in the same directory.
+            ("go", &["go.mod", "package.json"]),
+            ("next", &["next.config.ts", "package.json"]),
+        ];
+
+        for (expected, present) in cases {
+            let found = detect(present).unwrap_or_else(|| panic!("{present:?} matched nothing"));
+            assert_eq!(
+                found.name, expected,
+                "{present:?} should start as {expected}, not {}",
+                found.name
+            );
+        }
+    }
+
+    #[test]
+    fn an_override_for_a_recipe_a_project_is_not_does_not_reach_it() {
+        // A Laravel project holds vite.config.js too. Setting the vite recipe
+        // must not change how Laravel starts.
+        let mut by_recipe = HashMap::new();
+        by_recipe.insert(
+            "vite".to_string(),
+            RunOverride {
+                command: Some("npm run something-else".to_string()),
+                port: Some(4321),
+            },
+        );
+
+        let plan = plan_for(
+            "shop-web",
+            &["artisan", "package.json", "vite.config.js"],
+            &by_recipe,
+            &HashMap::new(),
+        )
+        .expect("a plan");
+        assert_eq!(plan.recipe, Some("laravel"));
+        assert!(
+            plan.command.contains("artisan"),
+            "the vite override reached a project that is not vite; got {}",
+            plan.command
+        );
+    }
+
+    #[test]
+    fn an_override_can_change_the_port_without_touching_the_command() {
+        let mut by_project = HashMap::new();
+        by_project.insert(
+            "shop-web".to_string(),
+            RunOverride {
+                command: None,
+                port: Some(9001),
+            },
+        );
+
+        let plan =
+            plan_for("shop-web", &["artisan"], &HashMap::new(), &by_project).expect("a plan");
+        assert_eq!(plan.port, Some(9001), "the port the override names");
+        assert!(
+            plan.command.contains("artisan"),
+            "and the command the recipe knows, not nothing; got {}",
+            plan.command
+        );
+    }
+
+    #[test]
+    fn a_port_with_no_command_anywhere_is_not_a_way_to_start_something() {
+        let mut by_project = HashMap::new();
+        by_project.insert(
+            "mystery".to_string(),
+            RunOverride {
+                command: None,
+                port: Some(9001),
+            },
+        );
+
+        // No marker matches, so nothing knows the command. A port on its own
+        // cannot start anything, and saying so beats starting the wrong thing.
+        assert!(plan_for("mystery", &["README.md"], &HashMap::new(), &by_project).is_none());
+    }
 }
