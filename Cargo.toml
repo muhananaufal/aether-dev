@@ -1,6 +1,6 @@
 [package]
 name = "aether-dev"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 license = "MIT"
 description = "Terminal dashboard for a local development environment: Docker services, projects, ports, and per-project toolchain versions"
