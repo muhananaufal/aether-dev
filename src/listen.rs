@@ -211,6 +211,12 @@ pub struct PortsConfig {
     pub names: Vec<String>,
 }
 
+// Derivable on exactly one platform. Windows and Linux both have real
+// defaults here; the third arm is empty because no capture of a real macOS
+// machine's output exists to write a parser against. Deriving would be right
+// for macOS and wrong for the other two, so the impl stays and the lint is
+// answered rather than obeyed.
+#[allow(clippy::derivable_impls)]
 impl Default for PortsConfig {
     fn default() -> Self {
         #[cfg(windows)]
