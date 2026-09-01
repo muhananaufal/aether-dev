@@ -1,6 +1,69 @@
 # Changelog
 
-## 0.2.0 — unreleased
+## 0.7.0
+
+### No external program is assumed
+
+- `[tools].git` and `[tools].kill` name the commands to run. A bare `git` is
+  found on PATH, which is right almost always and wrong on a machine with more
+  than one.
+- `[ports].probe` is a chain, tried in order until one answers. On Linux the
+  default is `ss` and then `netstat`, so a machine without iproute2 still gets
+  a list rather than a dead end. macOS gets an empty chain and an error naming
+  the setting, rather than a guess.
+- A probe names its output format as well as its command, because the two are
+  not interchangeable: netstat output read by the `ss` reader still yields the
+  right ports, with every process name lost and connections counted as
+  listeners — a list that looks complete and is not.
+- When every probe fails, the error names each attempt and why it failed.
+
+## 0.6.0
+
+- The TLS stack nothing used is gone. Every request goes to a Docker daemon on
+  this machine over plain HTTP, and `ring` — a C library reached through
+  rustls — was the only thing making the other platforms unbuildable from a
+  Windows host. The binary went from 5,208,064 to 3,679,744 bytes with it.
+- Linux and macOS compile, and CI builds and runs the tests on both. That is
+  the first time the `#[cfg(unix)]` branches had ever been compiled.
+- A scan that finds nothing says where it looked and what named that place,
+  and offers `adev config --init` when no configuration was found at all.
+
+## 0.5.0
+
+- `enter` on any row lists what can be done with it, in words, with the key
+  that does each one beside it. Choosing an entry becomes that keystroke, so
+  the menu is a way of finding the actions rather than a second copy of them.
+- A refresh landing while a menu is open no longer replaces the list
+  underneath it, which would have moved the row the action was meant for.
+- Below 100 columns a strip along the top names all three panes, so a terminal
+  showing one of them no longer looks like the whole tool.
+
+## 0.4.0
+
+- The ports pane lists every listening port rather than only the handful
+  Docker publishes. The question it exists to answer was the one it could not.
+- `K` ends what holds a port, `v` shows a project's toolchain versions, `d`
+  lists the routed hostnames, and `E`, `I`, `.`, `A`, `X` and `:` cover the
+  database dumps, the `.env` variants, the domains, and running one command.
+- Two actions ask before they act, and only two: ending a process, and
+  replacing a database with a dump.
+
+## 0.3.0
+
+- `[service.<name>]` declares the services this machine is meant to have.
+  Declaring one makes it visible before it exists, and it is where the
+  container name, port, hostname, panel URL and database credentials stop
+  being this tool's guesses.
+- A declared port stays on the row while the container is stopped. Docker
+  publishes no ports for a stopped container, so the row lost its number at
+  exactly the moment it was needed to start the thing again.
+- `[open]`, `[memory]` and `[backup]` — the browser, the file manager, the two
+  numbers in the footer, and where the dashboard writes a dump.
+- A tool's `when` decides which projects it applies to, which is how a Go or
+  Python toolchain becomes relevant without this code knowing the language
+  exists. It had been written, tested, and never called.
+
+## 0.2.0
 
 ### Toolchain versions
 
