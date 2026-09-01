@@ -40,3 +40,25 @@ jobs:
 
       - name: Build
         run: cargo build --release
+
+  # Cargo.toml promises rust-version = "1.88", and until this job nothing
+  # checked it: every other job runs stable, which keeps passing long after
+  # some new syntax has quietly raised the real floor. A promise nobody tests
+  # is how that number came to be written wrong in the first place.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the oldest Rust we claim to support
+        uses: dtolnay/rust-toolchain@1.88
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      # Check rather than test: this asks whether the code compiles on the
+      # version we tell people to have. What it does once compiled is the
+      # other jobs' business.
+      - name: Compiles on the version we promise
+        run: cargo check --all-targets --locked

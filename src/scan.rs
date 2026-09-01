@@ -53,9 +53,17 @@ impl<G: GitReader + 'static> ProjectScanner for FsProjectScanner<G> {
 
         for root in &config.roots {
             if !root.is_dir() {
+                // A configured root that is not there is usually a drive that
+                // is not plugged in, which is a normal Tuesday rather than a
+                // fault. Said plainly, because "failure" next to an unplugged
+                // disk reads like damage.
+                let reason = match root.exists() {
+                    true => "not a directory",
+                    false => "not there right now — a drive that is not connected looks like this",
+                };
                 let _ = sink.send(ScanEvent::Failed {
                     path: root.clone(),
-                    reason: "not a readable directory".to_string(),
+                    reason: reason.to_string(),
                 });
                 continue;
             }
