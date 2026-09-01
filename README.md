@@ -418,6 +418,13 @@ reports.
   mentions Node does not get one put in front of it.
 - Nothing yet reads a wanted version out of a `go.mod` or a `pyproject.toml`,
   so for those a pin or the newest installed decides.
+- Every external program is named in the configuration: `[tools]` for git and
+  the kill command, `[ports].probe` for what lists listening sockets. A probe
+  names its output format as well as its command, because the two are not
+  interchangeable.
+- macOS has no default port probe. No capture of a real machine's output exists
+  to write a parser against, so `adev ports` there says which setting to fill
+  in rather than guessing.
 - The memory footer reads `free` inside the guest and `tasklist` on Windows.
   On macOS the backing process is named differently between Docker Desktop
   versions, so `host_process` is empty there until somebody sets it.
