@@ -315,7 +315,6 @@ ignore = ["node_modules", "vendor", "target", ".git"]
 [scan]
 workers = 12                   # git runs this many repositories at a time
 git_timeout_ms = 2000
-cache_ttl_secs = 30
 
 [docker]
 endpoint = "auto"              # auto follows DOCKER_HOST
