@@ -3982,4 +3982,92 @@ mod tests {
             "nothing configured means nothing changed, not an empty PATH"
         );
     }
+
+    /// The README says every command has a key in the dashboard. This is what
+    /// stops that from quietly becoming untrue.
+    ///
+    /// The match is exhaustive on purpose: adding a command to the enum stops
+    /// this compiling until somebody writes down which key reaches it, or says
+    /// in one word why none does. A claim in a README rots silently; a claim
+    /// the compiler enforces does not.
+    #[test]
+    fn every_command_is_reachable_from_the_dashboard() {
+        use aether_dev::cli::Command;
+
+        // What reaches each command from inside the dashboard. `None` is a
+        // deliberate answer, not a gap, and the reason is beside it.
+        fn key_for(command: &Command) -> Option<char> {
+            match command {
+                // The dashboard itself: you are already in it.
+                Command::Tui => None,
+                Command::Scan { .. } => Some('r'),
+                Command::Services { .. } => Some('2'),
+                Command::Ports { .. } => Some('3'),
+                Command::Logs { .. } => Some('l'),
+                Command::Start { .. } => Some('s'),
+                Command::Stop { .. } => Some('x'),
+                Command::Restart { .. } => Some('S'),
+                Command::Kill { .. } => Some('K'),
+                Command::Run { .. } => Some('p'),
+                Command::Shell { .. } => Some('t'),
+                Command::Exec { .. } => Some(':'),
+                Command::Env { .. } => Some('v'),
+                Command::Dotenv { .. } => Some('.'),
+                Command::Open { .. } => Some('o'),
+                Command::Config { .. } => Some('g'),
+                // db backup is b, export E, import I. One key per command is
+                // what this checks; b stands for the group.
+                Command::Db { .. } => Some('b'),
+                // domains list is d, add A, remove X.
+                Command::Domains { .. } => Some('d'),
+            }
+        }
+
+        // Every key named above has to be a key the dashboard actually
+        // publishes, or the mapping is a second piece of documentation that
+        // can drift from the first.
+        // One entry can name several keys - "tab / 1 2 3" is one line and four
+        // ways in - so the label is split before single characters are taken.
+        let published: Vec<char> = aether_dev::tui::keys()
+            .iter()
+            .flat_map(|(key, _)| key.split_whitespace())
+            .filter_map(|word| {
+                let mut chars = word.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Some(c),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let every_command = [
+            Command::Tui,
+            Command::Scan { json: false },
+            Command::Services {
+                json: false,
+                memory: false,
+            },
+            Command::Ports { json: false },
+        ];
+
+        for command in &every_command {
+            if let Some(key) = key_for(command) {
+                assert!(
+                    published.contains(&key),
+                    "{command:?} is mapped to {key:?}, which the dashboard does not offer"
+                );
+            }
+        }
+
+        // The keys the rest of the commands claim, checked the same way
+        // without having to construct every variant.
+        for key in [
+            'l', 's', 'x', 'S', 'K', 'p', 't', ':', 'v', '.', 'o', 'g', 'b', 'd',
+        ] {
+            assert!(
+                published.contains(&key),
+                "a command claims {key:?} and the dashboard does not offer it"
+            );
+        }
+    }
 }

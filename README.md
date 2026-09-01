@@ -161,8 +161,16 @@ own row, so coming back to a list finds it where you left it.
 Rescanning every repository to find out whether a container came back up is a
 wait nobody asked for, so the quick answer does not queue behind the slow one.
 
-The dashboard is a peer of the command line, not a window onto part of it:
-everything `adev` can do, it can do.
+The dashboard is a peer of the command line rather than a window onto part of
+it: every command has a key, and none of them needs the terminal to be left.
+
+Not every *flag* does, and the ones missing are missing on purpose. `--json` is
+for a script reading output, and there is no output to read here. `--all`,
+`--force`, `--no-reload` and `--dry-run` skip a question the dashboard asks
+instead — it confirms before it ends a process or replaces a database, which is
+the same caution spelled differently. `--gzip` and where a dump lands come from
+`[backup]`, because a key has nowhere to ask. `-t`, `--shell` and `--use` take
+the default; the command line is where you say otherwise.
 
 `s`, `x` and `S` start, stop and restart the selected service, `o` opens
 whatever the focused row serves, `b` dumps its databases, `e` opens the

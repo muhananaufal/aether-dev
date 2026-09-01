@@ -1113,6 +1113,12 @@ fn human_bytes(bytes: u64) -> String {
 
 /// Every key, on request. The status line has room for two of them, and a
 /// dashboard with a dozen actions cannot teach them from a strip of text.
+/// The keys the dashboard publishes, so a test elsewhere can check that
+/// whatever claims a key actually has one.
+pub fn keys() -> &'static [(&'static str, &'static str)] {
+    KEYS
+}
+
 const KEYS: &[(&str, &str)] = &[
     ("enter", "what you can do with the selected row"),
     ("tab / 1 2 3", "move between panes"),
