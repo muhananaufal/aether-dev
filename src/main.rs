@@ -24,7 +24,7 @@ use aether_dev::tui::{Dashboard, Detail, Editing, Layer, MenuItem, MenuKey, Noti
 use clap::Parser;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use serde::Serialize;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -1083,443 +1083,18 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            // A question outranks every other key. Only an explicit y goes
-            // ahead: anything else, including a stray arrow key, is a no, so
-            // there is no keystroke that destroys something by accident.
-            if dashboard.layer() == Layer::Confirm {
-                let yes = tui::is_yes(key.code);
-                dashboard.dismiss();
-                match (yes, pending.take()) {
-                    (true, Some(Pending::Kill { pid, label })) => {
-                        dashboard
-                            .apply(Update::Notice(Notice::working(format!("killing {label}"))));
-                        spawn_kill(config, pid, label, updates.clone());
-                    }
-                    (
-                        true,
-                        Some(Pending::Import {
-                            service,
-                            database,
-                            file,
-                        }),
-                    ) => {
-                        dashboard.apply(Update::Notice(Notice::working(format!(
-                            "loading into {database}"
-                        ))));
-                        spawn_import(config, service, database, file, updates.clone());
-                    }
-                    (true, Some(Pending::RemoveDomain { host })) => {
-                        let notice = match remove_domain(config, &host) {
-                            Ok(said) => Notice::done(said),
-                            Err(reason) => Notice::failed(reason),
-                        };
-                        dashboard.apply(Update::Notice(notice));
-                    }
-                    (true, None) => {}
-                    (false, _) => {
-                        dashboard.apply(Update::Notice(Notice::done("left alone")));
-                    }
-                }
-                continue;
-            }
-            // A prompt takes every key too, or j and k would move a list
-            // instead of landing in the name being typed.
-            if dashboard.layer() == Layer::Prompt {
-                match tui::editing(key.code) {
-                    Editing::Cancel => {
-                        dashboard.cancel_prompt();
-                        dashboard.close_detail();
-                        asking = None;
-                    }
-                    Editing::Backspace => dashboard.backspace(),
-                    Editing::Type(c) => dashboard.type_char(c),
-                    Editing::Accept => {
-                        let typed = dashboard.take_typed().unwrap_or_default();
-                        dashboard.close_detail();
-                        let step = asking.take();
-                        if typed.trim().is_empty() {
-                            dashboard.apply(Update::Notice(Notice::failed(
-                                "nothing typed, nothing done",
-                            )));
-                            continue;
-                        }
-                        let typed = typed.trim().to_string();
-                        match step {
-                            Some(Asking::ExportDatabase { service }) => {
-                                dashboard.apply(Update::Notice(Notice::working(format!(
-                                    "dumping {typed}"
-                                ))));
-                                spawn_export(config, service, typed, updates.clone());
-                            }
-                            Some(Asking::ImportFile { service }) => {
-                                dashboard.ask_for("into which database");
-                                asking = Some(Asking::ImportDatabase {
-                                    service,
-                                    file: typed,
-                                });
-                            }
-                            Some(Asking::ImportDatabase { service, file }) => {
-                                // The last gate before something is overwritten,
-                                // naming both ends so a wrong answer is visible
-                                // before it is given.
-                                dashboard.ask(format!("replace {typed} on {service} with {file}?"));
-                                pending = Some(Pending::Import {
-                                    service,
-                                    database: typed,
-                                    file: PathBuf::from(file),
-                                });
-                            }
-                            Some(Asking::SwitchDotenv { path }) => {
-                                let notice = match switch_dotenv(&path, &typed) {
-                                    Ok(said) => Notice::done(said),
-                                    Err(reason) => Notice::failed(reason),
-                                };
-                                dashboard.apply(Update::Notice(notice));
-                            }
-                            Some(Asking::DomainHost) => {
-                                dashboard.ask_for("pointing at (container:port)");
-                                asking = Some(Asking::DomainUpstream { host: typed });
-                            }
-                            Some(Asking::DomainUpstream { host }) => {
-                                let notice = match add_domain(config, &host, &typed) {
-                                    Ok(said) => Notice::done(said),
-                                    Err(reason) => Notice::failed(reason),
-                                };
-                                dashboard.apply(Update::Notice(notice));
-                            }
-                            Some(Asking::DomainRemove) => {
-                                dashboard.ask(format!("stop routing {typed}?"));
-                                pending = Some(Pending::RemoveDomain { host: typed });
-                            }
-                            Some(Asking::ExecCommand { project }) => {
-                                break Ok(Leave::Exec(project, typed));
-                            }
-                            None => {}
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            // A log takes the screen, so it takes the keys too. Leaving the
-            // pane keys live behind it would move a list nobody can see.
-            if dashboard.layer() == Layer::Logs {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('l') => {
-                        if let Some(stop) = watching.take() {
-                            stop.store(true, Ordering::Relaxed);
-                        }
-                        dashboard.close_logs();
-                    }
-                    KeyCode::Char('?') => dashboard.toggle_help(),
-                    KeyCode::Char('j') | KeyCode::Down => dashboard.scroll_logs(1),
-                    KeyCode::Char('k') | KeyCode::Up => dashboard.scroll_logs(-1),
-                    KeyCode::PageDown => dashboard.scroll_logs(10),
-                    KeyCode::PageUp => dashboard.scroll_logs(-10),
-                    _ => {}
-                }
-                continue;
-            }
-
-            // The menu is a way of finding the keys, not a second path to the
-            // actions: choosing an entry becomes the keystroke it names, and
-            // falls through to exactly the same handling below.
-            let mut code = key.code;
-            if dashboard.layer() == Layer::Menu {
-                match tui::menu_key(code) {
-                    MenuKey::Close => {
-                        dashboard.close_menu();
-                        continue;
-                    }
-                    MenuKey::Down => {
-                        dashboard.menu_move(1);
-                        continue;
-                    }
-                    MenuKey::Up => {
-                        dashboard.menu_move(-1);
-                        continue;
-                    }
-                    MenuKey::Choose => match dashboard.take_menu_choice() {
-                        Some(chosen) => code = KeyCode::Char(chosen),
-                        None => continue,
-                    },
-                    // Anything else while a menu is open is a slip, not a
-                    // command meant for the screen behind it.
-                    MenuKey::Ignore => continue,
-                }
-            }
-
-            match code {
-                // Everything the selected row can do, in words. This is the
-                // way in for anybody who would rather not memorise anything.
-                KeyCode::Enter => match menu_for(&dashboard) {
-                    Some((subject, items)) => dashboard.open_menu(subject, items),
-                    None => dashboard.apply(Update::Notice(Notice::failed(
-                        "nothing is selected here yet",
-                    ))),
-                },
-                KeyCode::Char('?') => dashboard.toggle_help(),
-                KeyCode::Char('g') => dashboard.toggle_settings(),
-                KeyCode::Char('l') => match dashboard.selected_service() {
-                    Some(service) => {
-                        let container = service.container.clone();
-                        watching =
-                            Some(spawn_log_stream(config, container.clone(), updates.clone()));
-                        dashboard.open_logs(container);
-                    }
-                    None => dashboard.apply(Update::Notice(Notice::failed(
-                        "l reads a service's log — move to the services or ports pane first",
-                    ))),
-                },
-                // Esc closes the key list when it is open, and only quits when
-                // there is nothing left to close.
-                KeyCode::Esc if dashboard.showing_help() => dashboard.toggle_help(),
-                KeyCode::Esc if dashboard.showing_detail() => dashboard.close_detail(),
-                KeyCode::Char('q') | KeyCode::Esc => break Ok(Leave::Quit),
-                KeyCode::Tab | KeyCode::Right => dashboard.focus_next(),
-                KeyCode::BackTab | KeyCode::Left => dashboard.focus_previous(),
-                KeyCode::Char('1') => dashboard.focus_on(Pane::Projects),
-                KeyCode::Char('2') => dashboard.focus_on(Pane::Services),
-                KeyCode::Char('3') => dashboard.focus_on(Pane::Ports),
-                KeyCode::Char('j') | KeyCode::Down => dashboard.move_selection(1),
-                KeyCode::Char('k') | KeyCode::Up => dashboard.move_selection(-1),
-                KeyCode::PageDown => dashboard.move_selection(10),
-                KeyCode::PageUp => dashboard.move_selection(-10),
-                // The new collectors report into the same channel the loop is
-                // already draining, so their results land like any other.
-                // Refresh what you are looking at. Rescanning every repository
-                // to find out whether a container restarted is a wait nobody
-                // asked for, so the focused pane decides what is redone.
-                KeyCode::Char('r') => match dashboard.focus() {
-                    Pane::Projects => {
-                        dashboard.begin_refresh();
-                        dashboard.apply(Update::Notice(Notice::working("rescanning projects")));
-                        spawn_project_collector(config, updates.clone());
-                    }
-                    Pane::Services => {
-                        dashboard.apply(Update::Notice(Notice::working("rereading services")));
-                        spawn_service_collector(config, updates.clone());
-                    }
-                    // Both, because the pane names the container behind each
-                    // port and that name comes from the services.
-                    Pane::Ports => {
-                        dashboard.apply(Update::Notice(Notice::working("rereading ports")));
-                        spawn_service_collector(config, updates.clone());
-                        spawn_port_collector(config, updates.clone());
-                    }
-                },
-                KeyCode::Char('R') => {
-                    dashboard.begin_refresh();
-                    dashboard.apply(Update::Notice(Notice::working("refreshing everything")));
-                    spawn_collectors(config, updates.clone());
-                }
-
-                // Container actions stay here: they finish in a moment and the
-                // answer belongs beside the row that changed.
-                KeyCode::Char('s') | KeyCode::Char('x') | KeyCode::Char('S') => {
-                    let action = match key.code {
-                        KeyCode::Char('s') => Action::Start,
-                        KeyCode::Char('x') => Action::Stop,
-                        _ => Action::Restart,
-                    };
-                    match dashboard.selected_service() {
-                        Some(service) => spawn_service_action(
-                            config,
-                            service.container.clone(),
-                            action,
-                            updates.clone(),
-                        ),
-                        None => dashboard.apply(Update::Notice(Notice::failed(
-                            "no service here — move to the services or ports pane first",
-                        ))),
-                    }
-                }
-
-                KeyCode::Char('o') => {
-                    // Whatever the focused row is: a service's declared page or
-                    // its port, a project's address, or just the port a stray
-                    // listener holds. Every pane has something worth opening.
-                    let url = match dashboard.focus() {
-                        Pane::Projects => dashboard
-                            .selected_project()
-                            .and_then(|project| project_url(config, &project.name, &project.path)),
-                        _ => dashboard
-                            .selected_service()
-                            .and_then(|service| {
-                                panel_for(config, &service.service).or_else(|| {
-                                    service.port.map(|port| format!("http://localhost:{port}"))
-                                })
-                            })
-                            .or_else(|| {
-                                dashboard
-                                    .selected_port()
-                                    .map(|l| format!("http://localhost:{}", l.port))
-                            }),
-                    };
-                    let notice = match url {
-                        Some(url) => match spawn_opener(&config.open.browser, &url) {
-                            Ok(()) => Notice::done(format!("opened {url}")),
-                            Err(error) => Notice::failed(format!("{url}: {error}")),
-                        },
-                        None => Notice::failed("nothing here says which address to open"),
-                    };
-                    dashboard.apply(Update::Notice(notice));
-                }
-
-                // Dumping every database on a service needs no arguments, so it
-                // is the one database job the dashboard can do without asking
-                // anything. It runs on a thread: a large database takes long
-                // enough that doing it here would freeze the screen.
-                KeyCode::Char('b') => match dashboard.selected_service().cloned() {
-                    Some(service) => {
-                        dashboard.apply(Update::Notice(Notice::working(format!(
-                            "backing up {}",
-                            service.service
-                        ))));
-                        spawn_backup(config, service, updates.clone());
-                    }
-                    None => dashboard.apply(Update::Notice(Notice::failed(
-                        "b backs up a service — move to the services or ports pane first",
-                    ))),
-                },
-
-                // Ending a process is the one thing here that cannot be undone,
-                // so it asks first and names what it is about to end.
-                KeyCode::Char('K') => {
-                    let target = dashboard
-                        .selected_port()
-                        .and_then(|l| l.pid.map(|pid| (pid, l.port, l.process.clone())));
-                    match target {
-                        Some((pid, port, process)) => {
-                            let label = format!(
-                                "{} (pid {pid}) on {port}",
-                                process.unwrap_or_else(|| "that process".to_string())
-                            );
-                            dashboard.ask(format!("kill {label}?"));
-                            pending = Some(Pending::Kill { pid, label });
-                        }
-                        None => dashboard.apply(Update::Notice(Notice::failed(
-                            "K ends what holds a port — move to the ports pane first",
-                        ))),
-                    }
-                }
-
-                // The database jobs. Export asks only for a name; import asks
-                // for the file, then the database, then whether you meant it.
-                KeyCode::Char('E') => match dashboard.selected_service() {
-                    Some(service) => {
-                        let service = service.service.clone();
-                        dashboard.ask_for("which database to dump");
-                        asking = Some(Asking::ExportDatabase { service });
-                    }
-                    None => dashboard.apply(Update::Notice(Notice::failed(
-                        "E dumps one database — move to the services or ports pane first",
-                    ))),
-                },
-                KeyCode::Char('I') => match dashboard.selected_service() {
-                    Some(service) => {
-                        let service = service.service.clone();
-                        dashboard.ask_for("dump file to load");
-                        asking = Some(Asking::ImportFile { service });
-                    }
-                    None => dashboard.apply(Update::Notice(Notice::failed(
-                        "I loads a dump — move to the services or ports pane first",
-                    ))),
-                },
-
-                // Which .env this project runs with, and a way to change it.
-                // The list is shown while the name is being typed, because
-                // nobody remembers the exact spelling of every variant.
-                KeyCode::Char('.') => match dashboard.selected_project() {
-                    Some(project) => {
-                        let (name, path) = (project.name.clone(), project.path.clone());
-                        dashboard.show_detail(dotenv_detail(&name, &path));
-                        dashboard.ask_for("switch .env to");
-                        asking = Some(Asking::SwitchDotenv { path });
-                    }
-                    None => dashboard.apply(Update::Notice(Notice::failed(
-                        ". shows a project's .env — move to the projects pane first",
-                    ))),
-                },
-
-                // Routing. A is a hostname and where it points; X stops one.
-                KeyCode::Char('A') => {
-                    dashboard.ask_for("hostname to route");
-                    asking = Some(Asking::DomainHost);
-                }
-                KeyCode::Char('X') => {
-                    dashboard.show_detail(domain_detail(config).unwrap_or_else(|reason| Detail {
-                        title: "Domains".to_string(),
-                        lines: vec![("error".to_string(), reason)],
-                        hint: "esc to close".to_string(),
-                    }));
-                    dashboard.ask_for("hostname to stop routing");
-                    asking = Some(Asking::DomainRemove);
-                }
-
-                // One command in a project, on its toolchain. Like enter and t,
-                // it hands the terminal over rather than fighting for it.
-                KeyCode::Char(':') => match dashboard.selected_project() {
-                    Some(project) => {
-                        let project = project.name.clone();
-                        dashboard.ask_for("command to run in it");
-                        asking = Some(Asking::ExecCommand { project });
-                    }
-                    None => dashboard.apply(Update::Notice(Notice::failed(
-                        ": runs a command in a project — move to the projects pane first",
-                    ))),
-                },
-
-                // Which versions this project resolves to, and why.
-                KeyCode::Char('v') => match dashboard.selected_project() {
-                    Some(project) => {
-                        let detail = toolchain_detail(config, &project.name, &project.path);
-                        dashboard.show_detail(detail);
-                    }
-                    None => dashboard.apply(Update::Notice(Notice::failed(
-                        "v shows a project's toolchains — move to the projects pane first",
-                    ))),
-                },
-
-                // Every hostname the proxy would serve, from both sources.
-                KeyCode::Char('d') => match domain_detail(config) {
-                    Ok(detail) => dashboard.show_detail(detail),
-                    Err(reason) => dashboard.apply(Update::Notice(Notice::failed(reason))),
-                },
-
-                // The project's directory, in whatever this machine uses to
-                // look at directories.
-                KeyCode::Char('e') => {
-                    let notice = match dashboard.selected_project() {
-                        Some(project) => {
-                            let path = project.path.display().to_string();
-                            match spawn_opener(&config.open.file_manager, &path) {
-                                Ok(()) => Notice::done(format!("opened {path}")),
-                                Err(error) => Notice::failed(format!("{path}: {error}")),
-                            }
-                        }
-                        None => Notice::failed(
-                            "e opens a project's folder — move to the projects pane first",
-                        ),
-                    };
-                    dashboard.apply(Update::Notice(notice));
-                }
-
-                // Anything that wants the terminal gets it, once the dashboard
-                // has handed it back. Fighting over stdout would garble both.
-                KeyCode::Char('p') => match dashboard.selected_project() {
-                    Some(project) => break Ok(Leave::Run(project.name.clone())),
-                    None => dashboard.apply(Update::Notice(Notice::failed(
-                        "p starts a project — move to the projects pane first",
-                    ))),
-                },
-                KeyCode::Char('t') => match dashboard.selected_project() {
-                    Some(project) => break Ok(Leave::Shell(project.name.clone())),
-                    None => dashboard.apply(Update::Notice(Notice::failed(
-                        "t opens a shell in a project — move to the projects pane first",
-                    ))),
-                },
-                _ => {}
+            // One keystroke, decided somewhere it can be tested.
+            match on_key(
+                key,
+                &mut dashboard,
+                config,
+                &updates,
+                &mut watching,
+                &mut pending,
+                &mut asking,
+            ) {
+                Step::Stay => {}
+                Step::Leave(leave) => break Ok(leave),
             }
         }
     });
@@ -3097,4 +2672,723 @@ fn settings_lines(config: &Config, chosen: Option<&Path>) -> Vec<(String, String
         }
     }
     lines
+}
+
+/// Whether the dashboard keeps the terminal after a keystroke, or hands it to
+/// something that wants it whole.
+enum Step {
+    Stay,
+    Leave(Leave),
+}
+
+/// What one keystroke does to a running dashboard.
+///
+/// Lifted out of the event loop so it can be driven without a terminal. The
+/// loop was five hundred lines with no test of any kind, and three of the four
+/// layers it dispatches through were added in a single session, verified by
+/// nothing but reasoning about them. Everything it touches is a parameter, so
+/// a test can hand it a dashboard and a channel and read back what happened.
+fn on_key(
+    key: KeyEvent,
+    dashboard: &mut Dashboard,
+    config: &Config,
+    updates: &Sender<Update>,
+    watching: &mut Option<Arc<AtomicBool>>,
+    pending: &mut Option<Pending>,
+    asking: &mut Option<Asking>,
+) -> Step {
+    // A question outranks every other key. Only an explicit y goes
+    // ahead: anything else, including a stray arrow key, is a no, so
+    // there is no keystroke that destroys something by accident.
+    if dashboard.layer() == Layer::Confirm {
+        let yes = tui::is_yes(key.code);
+        dashboard.dismiss();
+        match (yes, pending.take()) {
+            (true, Some(Pending::Kill { pid, label })) => {
+                dashboard.apply(Update::Notice(Notice::working(format!("killing {label}"))));
+                spawn_kill(config, pid, label, updates.clone());
+            }
+            (
+                true,
+                Some(Pending::Import {
+                    service,
+                    database,
+                    file,
+                }),
+            ) => {
+                dashboard.apply(Update::Notice(Notice::working(format!(
+                    "loading into {database}"
+                ))));
+                spawn_import(config, service, database, file, updates.clone());
+            }
+            (true, Some(Pending::RemoveDomain { host })) => {
+                let notice = match remove_domain(config, &host) {
+                    Ok(said) => Notice::done(said),
+                    Err(reason) => Notice::failed(reason),
+                };
+                dashboard.apply(Update::Notice(notice));
+            }
+            (true, None) => {}
+            (false, _) => {
+                dashboard.apply(Update::Notice(Notice::done("left alone")));
+            }
+        }
+        return Step::Stay;
+    }
+    // A prompt takes every key too, or j and k would move a list
+    // instead of landing in the name being typed.
+    if dashboard.layer() == Layer::Prompt {
+        match tui::editing(key.code) {
+            Editing::Cancel => {
+                dashboard.cancel_prompt();
+                dashboard.close_detail();
+                *asking = None;
+            }
+            Editing::Backspace => dashboard.backspace(),
+            Editing::Type(c) => dashboard.type_char(c),
+            Editing::Accept => {
+                let typed = dashboard.take_typed().unwrap_or_default();
+                dashboard.close_detail();
+                let step = asking.take();
+                if typed.trim().is_empty() {
+                    dashboard.apply(Update::Notice(Notice::failed(
+                        "nothing typed, nothing done",
+                    )));
+                    return Step::Stay;
+                }
+                let typed = typed.trim().to_string();
+                match step {
+                    Some(Asking::ExportDatabase { service }) => {
+                        dashboard
+                            .apply(Update::Notice(Notice::working(format!("dumping {typed}"))));
+                        spawn_export(config, service, typed, updates.clone());
+                    }
+                    Some(Asking::ImportFile { service }) => {
+                        dashboard.ask_for("into which database");
+                        *asking = Some(Asking::ImportDatabase {
+                            service,
+                            file: typed,
+                        });
+                    }
+                    Some(Asking::ImportDatabase { service, file }) => {
+                        // The last gate before something is overwritten,
+                        // naming both ends so a wrong answer is visible
+                        // before it is given.
+                        dashboard.ask(format!("replace {typed} on {service} with {file}?"));
+                        *pending = Some(Pending::Import {
+                            service,
+                            database: typed,
+                            file: PathBuf::from(file),
+                        });
+                    }
+                    Some(Asking::SwitchDotenv { path }) => {
+                        let notice = match switch_dotenv(&path, &typed) {
+                            Ok(said) => Notice::done(said),
+                            Err(reason) => Notice::failed(reason),
+                        };
+                        dashboard.apply(Update::Notice(notice));
+                    }
+                    Some(Asking::DomainHost) => {
+                        dashboard.ask_for("pointing at (container:port)");
+                        *asking = Some(Asking::DomainUpstream { host: typed });
+                    }
+                    Some(Asking::DomainUpstream { host }) => {
+                        let notice = match add_domain(config, &host, &typed) {
+                            Ok(said) => Notice::done(said),
+                            Err(reason) => Notice::failed(reason),
+                        };
+                        dashboard.apply(Update::Notice(notice));
+                    }
+                    Some(Asking::DomainRemove) => {
+                        dashboard.ask(format!("stop routing {typed}?"));
+                        *pending = Some(Pending::RemoveDomain { host: typed });
+                    }
+                    Some(Asking::ExecCommand { project }) => {
+                        return Step::Leave(Leave::Exec(project, typed));
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        return Step::Stay;
+    }
+    // A log takes the screen, so it takes the keys too. Leaving the
+    // pane keys live behind it would move a list nobody can see.
+    if dashboard.layer() == Layer::Logs {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('l') => {
+                if let Some(stop) = watching.take() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                dashboard.close_logs();
+            }
+            KeyCode::Char('?') => dashboard.toggle_help(),
+            KeyCode::Char('j') | KeyCode::Down => dashboard.scroll_logs(1),
+            KeyCode::Char('k') | KeyCode::Up => dashboard.scroll_logs(-1),
+            KeyCode::PageDown => dashboard.scroll_logs(10),
+            KeyCode::PageUp => dashboard.scroll_logs(-10),
+            _ => {}
+        }
+        return Step::Stay;
+    }
+
+    // The menu is a way of finding the keys, not a second path to the
+    // actions: choosing an entry becomes the keystroke it names, and
+    // falls through to exactly the same handling below.
+    let mut code = key.code;
+    if dashboard.layer() == Layer::Menu {
+        match tui::menu_key(code) {
+            MenuKey::Close => {
+                dashboard.close_menu();
+                return Step::Stay;
+            }
+            MenuKey::Down => {
+                dashboard.menu_move(1);
+                return Step::Stay;
+            }
+            MenuKey::Up => {
+                dashboard.menu_move(-1);
+                return Step::Stay;
+            }
+            MenuKey::Choose => match dashboard.take_menu_choice() {
+                Some(chosen) => code = KeyCode::Char(chosen),
+                None => return Step::Stay,
+            },
+            // Anything else while a menu is open is a slip, not a
+            // command meant for the screen behind it.
+            MenuKey::Ignore => return Step::Stay,
+        }
+    }
+
+    match code {
+        // Everything the selected row can do, in words. This is the
+        // way in for anybody who would rather not memorise anything.
+        KeyCode::Enter => match menu_for(dashboard) {
+            Some((subject, items)) => dashboard.open_menu(subject, items),
+            None => dashboard.apply(Update::Notice(Notice::failed(
+                "nothing is selected here yet",
+            ))),
+        },
+        KeyCode::Char('?') => dashboard.toggle_help(),
+        KeyCode::Char('g') => dashboard.toggle_settings(),
+        KeyCode::Char('l') => match dashboard.selected_service() {
+            Some(service) => {
+                let container = service.container.clone();
+                *watching = Some(spawn_log_stream(config, container.clone(), updates.clone()));
+                dashboard.open_logs(container);
+            }
+            None => dashboard.apply(Update::Notice(Notice::failed(
+                "l reads a service's log — move to the services or ports pane first",
+            ))),
+        },
+        // Esc closes the key list when it is open, and only quits when
+        // there is nothing left to close.
+        KeyCode::Esc if dashboard.showing_help() => dashboard.toggle_help(),
+        KeyCode::Esc if dashboard.showing_detail() => dashboard.close_detail(),
+        KeyCode::Char('q') | KeyCode::Esc => return Step::Leave(Leave::Quit),
+        KeyCode::Tab | KeyCode::Right => dashboard.focus_next(),
+        KeyCode::BackTab | KeyCode::Left => dashboard.focus_previous(),
+        KeyCode::Char('1') => dashboard.focus_on(Pane::Projects),
+        KeyCode::Char('2') => dashboard.focus_on(Pane::Services),
+        KeyCode::Char('3') => dashboard.focus_on(Pane::Ports),
+        KeyCode::Char('j') | KeyCode::Down => dashboard.move_selection(1),
+        KeyCode::Char('k') | KeyCode::Up => dashboard.move_selection(-1),
+        KeyCode::PageDown => dashboard.move_selection(10),
+        KeyCode::PageUp => dashboard.move_selection(-10),
+        // The new collectors report into the same channel the loop is
+        // already draining, so their results land like any other.
+        // Refresh what you are looking at. Rescanning every repository
+        // to find out whether a container restarted is a wait nobody
+        // asked for, so the focused pane decides what is redone.
+        KeyCode::Char('r') => match dashboard.focus() {
+            Pane::Projects => {
+                dashboard.begin_refresh();
+                dashboard.apply(Update::Notice(Notice::working("rescanning projects")));
+                spawn_project_collector(config, updates.clone());
+            }
+            Pane::Services => {
+                dashboard.apply(Update::Notice(Notice::working("rereading services")));
+                spawn_service_collector(config, updates.clone());
+            }
+            // Both, because the pane names the container behind each
+            // port and that name comes from the services.
+            Pane::Ports => {
+                dashboard.apply(Update::Notice(Notice::working("rereading ports")));
+                spawn_service_collector(config, updates.clone());
+                spawn_port_collector(config, updates.clone());
+            }
+        },
+        KeyCode::Char('R') => {
+            dashboard.begin_refresh();
+            dashboard.apply(Update::Notice(Notice::working("refreshing everything")));
+            spawn_collectors(config, updates.clone());
+        }
+
+        // Container actions stay here: they finish in a moment and the
+        // answer belongs beside the row that changed.
+        KeyCode::Char('s') | KeyCode::Char('x') | KeyCode::Char('S') => {
+            // `code`, not `key.code`: a menu choice arrives as Enter and is
+            // rewritten above into the key the entry names. Reading the
+            // original here made "start it" restart instead.
+            let action = match code {
+                KeyCode::Char('s') => Action::Start,
+                KeyCode::Char('x') => Action::Stop,
+                _ => Action::Restart,
+            };
+            match dashboard.selected_service() {
+                Some(service) => {
+                    spawn_service_action(config, service.container.clone(), action, updates.clone())
+                }
+                None => dashboard.apply(Update::Notice(Notice::failed(
+                    "no service here — move to the services or ports pane first",
+                ))),
+            }
+        }
+
+        KeyCode::Char('o') => {
+            // Whatever the focused row is: a service's declared page or
+            // its port, a project's address, or just the port a stray
+            // listener holds. Every pane has something worth opening.
+            let url = match dashboard.focus() {
+                Pane::Projects => dashboard
+                    .selected_project()
+                    .and_then(|project| project_url(config, &project.name, &project.path)),
+                _ => dashboard
+                    .selected_service()
+                    .and_then(|service| {
+                        panel_for(config, &service.service)
+                            .or_else(|| service.port.map(|port| format!("http://localhost:{port}")))
+                    })
+                    .or_else(|| {
+                        dashboard
+                            .selected_port()
+                            .map(|l| format!("http://localhost:{}", l.port))
+                    }),
+            };
+            let notice = match url {
+                Some(url) => match spawn_opener(&config.open.browser, &url) {
+                    Ok(()) => Notice::done(format!("opened {url}")),
+                    Err(error) => Notice::failed(format!("{url}: {error}")),
+                },
+                None => Notice::failed("nothing here says which address to open"),
+            };
+            dashboard.apply(Update::Notice(notice));
+        }
+
+        // Dumping every database on a service needs no arguments, so it
+        // is the one database job the dashboard can do without asking
+        // anything. It runs on a thread: a large database takes long
+        // enough that doing it here would freeze the screen.
+        KeyCode::Char('b') => match dashboard.selected_service().cloned() {
+            Some(service) => {
+                dashboard.apply(Update::Notice(Notice::working(format!(
+                    "backing up {}",
+                    service.service
+                ))));
+                spawn_backup(config, service, updates.clone());
+            }
+            None => dashboard.apply(Update::Notice(Notice::failed(
+                "b backs up a service — move to the services or ports pane first",
+            ))),
+        },
+
+        // Ending a process is the one thing here that cannot be undone,
+        // so it asks first and names what it is about to end.
+        KeyCode::Char('K') => {
+            let target = dashboard
+                .selected_port()
+                .and_then(|l| l.pid.map(|pid| (pid, l.port, l.process.clone())));
+            match target {
+                Some((pid, port, process)) => {
+                    let label = format!(
+                        "{} (pid {pid}) on {port}",
+                        process.unwrap_or_else(|| "that process".to_string())
+                    );
+                    dashboard.ask(format!("kill {label}?"));
+                    *pending = Some(Pending::Kill { pid, label });
+                }
+                None => dashboard.apply(Update::Notice(Notice::failed(
+                    "K ends what holds a port — move to the ports pane first",
+                ))),
+            }
+        }
+
+        // The database jobs. Export asks only for a name; import asks
+        // for the file, then the database, then whether you meant it.
+        KeyCode::Char('E') => match dashboard.selected_service() {
+            Some(service) => {
+                let service = service.service.clone();
+                dashboard.ask_for("which database to dump");
+                *asking = Some(Asking::ExportDatabase { service });
+            }
+            None => dashboard.apply(Update::Notice(Notice::failed(
+                "E dumps one database — move to the services or ports pane first",
+            ))),
+        },
+        KeyCode::Char('I') => match dashboard.selected_service() {
+            Some(service) => {
+                let service = service.service.clone();
+                dashboard.ask_for("dump file to load");
+                *asking = Some(Asking::ImportFile { service });
+            }
+            None => dashboard.apply(Update::Notice(Notice::failed(
+                "I loads a dump — move to the services or ports pane first",
+            ))),
+        },
+
+        // Which .env this project runs with, and a way to change it.
+        // The list is shown while the name is being typed, because
+        // nobody remembers the exact spelling of every variant.
+        KeyCode::Char('.') => match dashboard.selected_project() {
+            Some(project) => {
+                let (name, path) = (project.name.clone(), project.path.clone());
+                dashboard.show_detail(dotenv_detail(&name, &path));
+                dashboard.ask_for("switch .env to");
+                *asking = Some(Asking::SwitchDotenv { path });
+            }
+            None => dashboard.apply(Update::Notice(Notice::failed(
+                ". shows a project's .env — move to the projects pane first",
+            ))),
+        },
+
+        // Routing. A is a hostname and where it points; X stops one.
+        KeyCode::Char('A') => {
+            dashboard.ask_for("hostname to route");
+            *asking = Some(Asking::DomainHost);
+        }
+        KeyCode::Char('X') => {
+            dashboard.show_detail(domain_detail(config).unwrap_or_else(|reason| Detail {
+                title: "Domains".to_string(),
+                lines: vec![("error".to_string(), reason)],
+                hint: "esc to close".to_string(),
+            }));
+            dashboard.ask_for("hostname to stop routing");
+            *asking = Some(Asking::DomainRemove);
+        }
+
+        // One command in a project, on its toolchain. Like enter and t,
+        // it hands the terminal over rather than fighting for it.
+        KeyCode::Char(':') => match dashboard.selected_project() {
+            Some(project) => {
+                let project = project.name.clone();
+                dashboard.ask_for("command to run in it");
+                *asking = Some(Asking::ExecCommand { project });
+            }
+            None => dashboard.apply(Update::Notice(Notice::failed(
+                ": runs a command in a project — move to the projects pane first",
+            ))),
+        },
+
+        // Which versions this project resolves to, and why.
+        KeyCode::Char('v') => match dashboard.selected_project() {
+            Some(project) => {
+                let detail = toolchain_detail(config, &project.name, &project.path);
+                dashboard.show_detail(detail);
+            }
+            None => dashboard.apply(Update::Notice(Notice::failed(
+                "v shows a project's toolchains — move to the projects pane first",
+            ))),
+        },
+
+        // Every hostname the proxy would serve, from both sources.
+        KeyCode::Char('d') => match domain_detail(config) {
+            Ok(detail) => dashboard.show_detail(detail),
+            Err(reason) => dashboard.apply(Update::Notice(Notice::failed(reason))),
+        },
+
+        // The project's directory, in whatever this machine uses to
+        // look at directories.
+        KeyCode::Char('e') => {
+            let notice = match dashboard.selected_project() {
+                Some(project) => {
+                    let path = project.path.display().to_string();
+                    match spawn_opener(&config.open.file_manager, &path) {
+                        Ok(()) => Notice::done(format!("opened {path}")),
+                        Err(error) => Notice::failed(format!("{path}: {error}")),
+                    }
+                }
+                None => {
+                    Notice::failed("e opens a project's folder — move to the projects pane first")
+                }
+            };
+            dashboard.apply(Update::Notice(notice));
+        }
+
+        // Anything that wants the terminal gets it, once the dashboard
+        // has handed it back. Fighting over stdout would garble both.
+        KeyCode::Char('p') => match dashboard.selected_project() {
+            Some(project) => return Step::Leave(Leave::Run(project.name.clone())),
+            None => dashboard.apply(Update::Notice(Notice::failed(
+                "p starts a project — move to the projects pane first",
+            ))),
+        },
+        KeyCode::Char('t') => match dashboard.selected_project() {
+            Some(project) => return Step::Leave(Leave::Shell(project.name.clone())),
+            None => dashboard.apply(Update::Notice(Notice::failed(
+                "t opens a shell in a project — move to the projects pane first",
+            ))),
+        },
+        _ => {}
+    }
+
+    Step::Stay
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether_dev::domain::{GitStatus, Stack};
+    use ratatui::crossterm::event::KeyModifiers;
+    use std::sync::mpsc::Receiver;
+
+    /// Everything `on_key` needs, so a test reads like a sequence of presses.
+    struct Keyboard {
+        dashboard: Dashboard,
+        config: Config,
+        updates: Sender<Update>,
+        heard: Receiver<Update>,
+        watching: Option<Arc<AtomicBool>>,
+        pending: Option<Pending>,
+        asking: Option<Asking>,
+    }
+
+    impl Keyboard {
+        fn new() -> Self {
+            let (updates, heard) = mpsc::channel();
+            Self {
+                dashboard: Dashboard::new(),
+                config: Config::default(),
+                updates,
+                heard,
+                watching: None,
+                pending: None,
+                asking: None,
+            }
+        }
+
+        fn with_a_project(mut self) -> Self {
+            self.dashboard.apply(Update::Project(Project {
+                name: "shop-web".to_string(),
+                category: None,
+                path: PathBuf::from("/tmp/shop-web"),
+                stack: Stack::Laravel,
+                framework: Some("Laravel 11".to_string()),
+                git: GitStatus::clean("main"),
+            }));
+            self.dashboard.apply(Update::ScanFinished { scanned: 1 });
+            self
+        }
+
+        fn with_a_service(mut self) -> Self {
+            self.dashboard.apply(Update::Services(vec![ServiceStatus {
+                container: "mysql-db".to_string(),
+                service: "mysql".to_string(),
+                port: Some(3306),
+                state: ServiceState::Running,
+                port_open: true,
+                memory_bytes: None,
+            }]));
+            self.dashboard.focus_on(Pane::Services);
+            self
+        }
+
+        fn press(&mut self, code: KeyCode) -> Step {
+            on_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &mut self.dashboard,
+                &self.config,
+                &self.updates,
+                &mut self.watching,
+                &mut self.pending,
+                &mut self.asking,
+            )
+        }
+
+        fn type_in(&mut self, text: &str) {
+            for c in text.chars() {
+                self.press(KeyCode::Char(c));
+            }
+        }
+
+        /// The last thing the dashboard was told, from either direction: a
+        /// handler that sets the notice itself, or a thread that sends one
+        /// through the channel. Both are how the screen gets told something,
+        /// and a test that watched only one of them would miss half.
+        fn last_notice(&mut self) -> Option<String> {
+            let mut last = self.dashboard.notice().map(|n| n.text.clone());
+            while let Ok(update) = self.heard.try_recv() {
+                if let Update::Notice(notice) = update {
+                    last = Some(notice.text);
+                }
+            }
+            last
+        }
+    }
+
+    #[test]
+    fn enter_opens_the_menu_and_choosing_from_it_does_what_it_names() {
+        let mut keys = Keyboard::new().with_a_service();
+
+        assert!(matches!(keys.press(KeyCode::Enter), Step::Stay));
+        assert!(
+            keys.dashboard.menu_open(),
+            "enter opens the list of actions"
+        );
+
+        // Down to the second entry, which the menu labels "stop it" and marks
+        // with x, then run it. Choosing and pressing are meant to be one path
+        // through the code; this shows it rather than asserting it.
+        keys.press(KeyCode::Down);
+        assert!(matches!(keys.press(KeyCode::Enter), Step::Stay));
+        assert!(!keys.dashboard.menu_open(), "choosing closes the menu");
+        assert_eq!(
+            keys.last_notice().as_deref(),
+            Some("stopping mysql-db…"),
+            "the second entry is stop, and choosing it stops"
+        );
+    }
+
+    #[test]
+    fn a_key_pressed_with_the_menu_open_does_not_reach_the_screen_behind_it() {
+        let mut keys = Keyboard::new().with_a_service();
+        keys.press(KeyCode::Enter);
+
+        // s would start the service if it got through to the panes.
+        keys.press(KeyCode::Char('s'));
+        assert!(keys.dashboard.menu_open(), "the menu stays open");
+        assert_eq!(keys.last_notice(), None, "and nothing happened");
+    }
+
+    #[test]
+    fn q_closes_a_menu_rather_than_quitting_the_dashboard() {
+        let mut keys = Keyboard::new().with_a_service();
+        keys.press(KeyCode::Enter);
+        assert!(matches!(keys.press(KeyCode::Char('q')), Step::Stay));
+        assert!(!keys.dashboard.menu_open());
+
+        // The same key with no menu open does leave.
+        assert!(matches!(
+            keys.press(KeyCode::Char('q')),
+            Step::Leave(Leave::Quit)
+        ));
+    }
+
+    #[test]
+    fn loading_a_dump_asks_for_the_file_then_the_database_then_whether_you_meant_it() {
+        let mut keys = Keyboard::new().with_a_service();
+
+        keys.press(KeyCode::Char('I'));
+        assert_eq!(keys.dashboard.prompting(), Some("dump file to load"));
+
+        keys.type_in("backup.sql");
+        keys.press(KeyCode::Enter);
+        assert_eq!(
+            keys.dashboard.prompting(),
+            Some("into which database"),
+            "a file alone is not enough to act on"
+        );
+
+        keys.type_in("shop");
+        keys.press(KeyCode::Enter);
+
+        let question = keys.dashboard.confirming().expect("a question").to_string();
+        assert!(
+            question.contains("shop") && question.contains("backup.sql"),
+            "the last gate before something is overwritten names both ends; got {question}"
+        );
+    }
+
+    #[test]
+    fn anything_but_y_leaves_the_database_alone() {
+        for refusal in [
+            KeyCode::Char('n'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Down,
+        ] {
+            let mut keys = Keyboard::new().with_a_service();
+            keys.press(KeyCode::Char('I'));
+            keys.type_in("backup.sql");
+            keys.press(KeyCode::Enter);
+            keys.type_in("shop");
+            keys.press(KeyCode::Enter);
+            assert!(keys.dashboard.confirming().is_some());
+
+            keys.press(refusal);
+            assert!(keys.dashboard.confirming().is_none(), "{refusal:?}");
+            assert_eq!(
+                keys.last_notice().as_deref(),
+                Some("left alone"),
+                "{refusal:?} must not be read as consent"
+            );
+            assert!(
+                keys.pending.is_none(),
+                "and the action is dropped, not left waiting for the next key"
+            );
+        }
+    }
+
+    #[test]
+    fn typing_a_movement_key_into_a_prompt_spells_it_instead_of_moving_a_list() {
+        let mut keys = Keyboard::new().with_a_service();
+        keys.press(KeyCode::Char('E'));
+        keys.type_in("jkq");
+        keys.press(KeyCode::Enter);
+
+        // Had j and k reached the panes, the name would be short or empty and
+        // the notice would name a different database.
+        assert_eq!(keys.last_notice().as_deref(), Some("dumping jkq"));
+    }
+
+    #[test]
+    fn an_empty_answer_does_nothing_rather_than_acting_on_a_blank() {
+        let mut keys = Keyboard::new().with_a_service();
+        keys.press(KeyCode::Char('E'));
+        keys.press(KeyCode::Enter);
+        assert_eq!(
+            keys.last_notice().as_deref(),
+            Some("nothing typed, nothing done")
+        );
+    }
+
+    #[test]
+    fn escape_throws_away_what_was_half_typed() {
+        let mut keys = Keyboard::new().with_a_service();
+        keys.press(KeyCode::Char('E'));
+        keys.type_in("shop");
+        keys.press(KeyCode::Esc);
+
+        assert!(keys.dashboard.prompting().is_none());
+        assert!(
+            keys.asking.is_none(),
+            "a cancelled sequence must not leave a step waiting for the next enter"
+        );
+    }
+
+    #[test]
+    fn running_a_project_hands_the_terminal_over_rather_than_staying() {
+        let mut keys = Keyboard::new().with_a_project();
+        keys.dashboard.focus_on(Pane::Projects);
+
+        match keys.press(KeyCode::Char('p')) {
+            Step::Leave(Leave::Run(project)) => assert_eq!(project, "shop-web"),
+            _ => panic!("p on a project must leave the dashboard"),
+        }
+    }
+
+    #[test]
+    fn a_key_that_needs_a_selection_says_which_pane_to_be_in() {
+        let mut keys = Keyboard::new().with_a_project();
+        keys.dashboard.focus_on(Pane::Projects);
+
+        // K ends what holds a port, and there is no port here.
+        keys.press(KeyCode::Char('K'));
+        let said = keys.last_notice().unwrap_or_default();
+        assert!(
+            said.contains("ports pane"),
+            "an action with no target should say where its target lives; got {said}"
+        );
+        assert!(keys.pending.is_none(), "and nothing is queued up");
+    }
 }
