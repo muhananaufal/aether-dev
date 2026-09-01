@@ -19,7 +19,8 @@ use aether_dev::proxy::DomainSet;
 use aether_dev::recipe;
 use aether_dev::scan::FsProjectScanner;
 use aether_dev::toolchain::{self, Reason, Resolution};
-use aether_dev::tui::{Dashboard, Detail, MenuItem, Notice, Pane, Update};
+use aether_dev::tui;
+use aether_dev::tui::{Dashboard, Detail, Editing, Layer, MenuItem, MenuKey, Notice, Pane, Update};
 use clap::Parser;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -1085,8 +1086,8 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
             // A question outranks every other key. Only an explicit y goes
             // ahead: anything else, including a stray arrow key, is a no, so
             // there is no keystroke that destroys something by accident.
-            if dashboard.confirming().is_some() {
-                let yes = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+            if dashboard.layer() == Layer::Confirm {
+                let yes = tui::is_yes(key.code);
                 dashboard.dismiss();
                 match (yes, pending.take()) {
                     (true, Some(Pending::Kill { pid, label })) => {
@@ -1123,16 +1124,16 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
             }
             // A prompt takes every key too, or j and k would move a list
             // instead of landing in the name being typed.
-            if dashboard.prompting().is_some() {
-                match key.code {
-                    KeyCode::Esc => {
+            if dashboard.layer() == Layer::Prompt {
+                match tui::editing(key.code) {
+                    Editing::Cancel => {
                         dashboard.cancel_prompt();
                         dashboard.close_detail();
                         asking = None;
                     }
-                    KeyCode::Backspace => dashboard.backspace(),
-                    KeyCode::Char(c) => dashboard.type_char(c),
-                    KeyCode::Enter => {
+                    Editing::Backspace => dashboard.backspace(),
+                    Editing::Type(c) => dashboard.type_char(c),
+                    Editing::Accept => {
                         let typed = dashboard.take_typed().unwrap_or_default();
                         dashboard.close_detail();
                         let step = asking.take();
@@ -1202,7 +1203,7 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
             }
             // A log takes the screen, so it takes the keys too. Leaving the
             // pane keys live behind it would move a list nobody can see.
-            if dashboard.logs().is_some() {
+            if dashboard.layer() == Layer::Logs {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('l') => {
                         if let Some(stop) = watching.take() {
@@ -1224,27 +1225,27 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
             // actions: choosing an entry becomes the keystroke it names, and
             // falls through to exactly the same handling below.
             let mut code = key.code;
-            if dashboard.menu_open() {
-                match code {
-                    KeyCode::Esc | KeyCode::Char('q') => {
+            if dashboard.layer() == Layer::Menu {
+                match tui::menu_key(code) {
+                    MenuKey::Close => {
                         dashboard.close_menu();
                         continue;
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    MenuKey::Down => {
                         dashboard.menu_move(1);
                         continue;
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
+                    MenuKey::Up => {
                         dashboard.menu_move(-1);
                         continue;
                     }
-                    KeyCode::Enter => match dashboard.take_menu_choice() {
+                    MenuKey::Choose => match dashboard.take_menu_choice() {
                         Some(chosen) => code = KeyCode::Char(chosen),
                         None => continue,
                     },
                     // Anything else while a menu is open is a slip, not a
                     // command meant for the screen behind it.
-                    _ => continue,
+                    MenuKey::Ignore => continue,
                 }
             }
 
