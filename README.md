@@ -21,13 +21,39 @@ inside WSL. Expect the rough edges of a tool that has met one environment.**
 
 ## Installing
 
+**A prebuilt binary.** Every tagged release carries archives for Windows,
+macOS on both Apple silicon and Intel, and Linux — the Linux one built against
+musl, so it is static and does not care how old the distribution is. Download
+from [releases](https://github.com/muhananaufal/aether-dev/releases), unpack,
+and put `adev` somewhere on PATH. Each archive has its SHA256 beside it, and
+one combined `SHA256SUMS` for the release.
+
+**With cargo-binstall**, which fetches the same binary rather than compiling:
+
 ```
+cargo binstall aether-dev
+```
+
+**From crates.io**, which compiles it on your machine:
+
+```
+cargo install aether-dev
+```
+
+**From source**, for a change you are making:
+
+```
+git clone https://github.com/muhananaufal/aether-dev
+cd aether-dev
 cargo install --path .
 ```
 
-That puts `adev` in `~/.cargo/bin`, which is already on PATH if you have Rust.
-To run it without installing, build with `cargo build --release` and call
-`target/release/adev` directly.
+Building needs Rust 1.88 or newer — the floor its dependencies set, not a
+preference. There is nothing else to install: the whole dependency tree is pure
+Rust, with no C toolchain and no system libraries involved.
+
+Package manager manifests for Scoop and Homebrew live in
+[`packaging/`](packaging/), with what to do with them.
 
 ## Configuring
 

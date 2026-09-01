@@ -1,0 +1,28 @@
+{
+    "version": "VERSION",
+    "description": "Terminal dashboard for a local development environment: Docker services, projects, ports, and per-project toolchain versions",
+    "homepage": "https://github.com/muhananaufal/aether-dev",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/muhananaufal/aether-dev/releases/download/vVERSION/adev-VERSION-x86_64-pc-windows-msvc.zip",
+            "hash": "SHA256",
+            "extract_dir": "adev-VERSION-x86_64-pc-windows-msvc"
+        }
+    },
+    "bin": "adev.exe",
+    "checkver": {
+        "github": "https://github.com/muhananaufal/aether-dev"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/muhananaufal/aether-dev/releases/download/v$version/adev-$version-x86_64-pc-windows-msvc.zip",
+                "extract_dir": "adev-$version-x86_64-pc-windows-msvc"
+            }
+        },
+        "hash": {
+            "url": "$url.sha256"
+        }
+    }
+}
