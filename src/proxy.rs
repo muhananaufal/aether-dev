@@ -35,16 +35,26 @@ pub struct DomainSet {
 
 impl DomainSet {
     pub fn from_toml_str(text: &str) -> Result<Self, DomainError> {
-        let mut set: DomainSet = toml::from_str(text)?;
-        // A file listing one host twice makes the generated config ambiguous,
-        // and picking either block silently would be a guess.
-        let mut seen: Vec<&str> = Vec::with_capacity(set.domains.len());
-        for domain in &set.domains {
-            if seen.contains(&domain.host.as_str()) {
-                return Err(DomainError::DuplicateHost(domain.host.clone()));
+        let raw: DomainSet = toml::from_str(text)?;
+
+        // Held to exactly the rule `add` holds a hostname to. Reading the file
+        // used to skip this, so the same name was legal or illegal depending
+        // on which way it arrived - and what came off disk went straight into
+        // the generated config, where a newline and a brace close one block
+        // and open another. Normalising here also means a name typed into the
+        // file by hand comes back the way the command would have written it.
+        let mut set = DomainSet::default();
+        for domain in raw.domains {
+            let host = normalise_host(&domain.host)?;
+            let upstream = validated_upstream(&domain.upstream)?;
+            // A file listing one host twice makes the generated config
+            // ambiguous, and picking either block silently would be a guess.
+            if set.domains.iter().any(|seen| seen.host == host) {
+                return Err(DomainError::DuplicateHost(host));
             }
-            seen.push(&domain.host);
+            set.domains.push(Domain { host, upstream });
         }
+
         set.domains.sort_by(|a, b| a.host.cmp(&b.host));
         Ok(set)
     }
@@ -132,12 +142,16 @@ impl DomainSet {
 /// slash, a capital letter - and reduces it to the one spelling stored, so the
 /// same domain cannot be added twice wearing a different coat.
 fn normalise_host(host: &str) -> Result<String, DomainError> {
+    // Lowercased first, then stripped: the other way round, a scheme typed as
+    // HTTP:// survives the strip and is then refused for containing a colon.
+    // Hostnames are case-insensitive and so are the schemes in front of them.
     let cleaned = host
         .trim()
+        .to_lowercase()
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/')
-        .to_lowercase();
+        .to_string();
 
     let usable = !cleaned.is_empty()
         && cleaned
@@ -299,5 +313,61 @@ mod tests {
             matches!(err, DomainError::DuplicateHost(_)),
             "two blocks for one host makes the generated file ambiguous, got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_host_in_the_file_is_held_to_the_same_rule_as_one_that_was_added() {
+        // `add` refuses these. Reading the file used not to, so the same
+        // hostname was legal or illegal depending on which way it arrived -
+        // and what came off disk went straight into the generated config.
+        for hostile in [
+            "shop.test {\n    respond \"anything\"\n}\nhttp://other.test",
+            "has a space.test",
+            "semi;colon.test",
+        ] {
+            let written = format!("[[domain]]\nhost = {hostile:?}\nupstream = \"web:80\"\n");
+            assert!(
+                DomainSet::from_toml_str(&written).is_err(),
+                "{hostile:?} would have been written into the Caddyfile as it stands"
+            );
+        }
+    }
+
+    #[test]
+    fn an_upstream_in_the_file_is_held_to_the_same_rule_too() {
+        let written = "[[domain]]\nhost = \"shop.test\"\nupstream = \"web:notaport\"\n".to_string();
+        assert!(DomainSet::from_toml_str(&written).is_err());
+    }
+
+    #[test]
+    fn a_file_written_by_hand_comes_back_in_the_shape_the_command_would_have_made() {
+        // Somebody typing into the file rather than using the command should
+        // not get a different result from the same hostname.
+        let set = DomainSet::from_toml_str(
+            "[[domain]]\nhost = \"HTTP://Shop.Test/\"\nupstream = \"web:80\"\n",
+        )
+        .expect("a hostname the command would have accepted");
+
+        assert_eq!(
+            set.entries()[0].host,
+            "shop.test",
+            "lowercased and stripped, the same way `adev domains add` does it"
+        );
+    }
+
+    #[test]
+    fn nothing_in_a_generated_caddyfile_can_close_the_block_it_is_inside() {
+        let mut set = DomainSet::default();
+        set.add("shop.test", "web:80").unwrap();
+        let written = set.to_caddyfile();
+
+        // Two braces per route and no more: one opening, one closing.
+        assert_eq!(
+            written.matches('{').count(),
+            written.matches('}').count(),
+            "a config whose braces do not balance is a config caddy will not load"
+        );
+        assert!(written.contains("http://shop.test {"));
+        assert!(written.contains("reverse_proxy web:80"));
     }
 }
