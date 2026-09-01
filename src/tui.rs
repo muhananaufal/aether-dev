@@ -2511,4 +2511,81 @@ mod tests {
         dashboard.toggle_settings();
         assert!(screen(&drawn(&mut dashboard, 120, 20)).contains("somewhere.toml"));
     }
+
+    #[test]
+    fn a_daemon_that_cannot_be_reached_does_not_read_as_nothing_running() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.apply(Update::ServicesFailed("connection refused".to_string()));
+
+        let view = screen(&drawn(&mut dashboard, 140, 20));
+        assert!(
+            view.contains("unreachable"),
+            "this is the lie the tool this replaces told: a database still \
+             starting, or a daemon that is down, shown as ready or as absent; \
+             got {view}"
+        );
+        assert!(
+            !view.contains("0 of 0 ready"),
+            "an unreachable daemon is not a daemon with nothing running"
+        );
+    }
+
+    #[test]
+    fn the_ports_pane_still_answers_when_docker_does_not() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.apply(Update::ServicesFailed("connection refused".to_string()));
+        // Ports come from the operating system, not from docker. Losing the
+        // daemon costs the container names beside them and nothing else.
+        dashboard.apply(Update::Ports(vec![Listener {
+            port: 5173,
+            pid: Some(900),
+            process: Some("node.exe".to_string()),
+        }]));
+
+        let view = screen(&drawn(&mut dashboard, 140, 20));
+        assert!(
+            view.contains("5173") && view.contains("node.exe"),
+            "got {view}"
+        );
+        assert_eq!(dashboard.rows_in(Pane::Ports), 1);
+    }
+
+    #[test]
+    fn a_daemon_that_comes_back_stops_being_reported_as_gone() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.apply(Update::ServicesFailed("connection refused".to_string()));
+        assert!(screen(&drawn(&mut dashboard, 140, 20)).contains("unreachable"));
+
+        dashboard.apply(Update::Services(vec![service("mysql", 3306, true)]));
+        let view = screen(&drawn(&mut dashboard, 140, 20));
+        assert!(
+            !view.contains("unreachable"),
+            "a failure that outlives itself is a second wrong answer; got {view}"
+        );
+        assert!(view.contains("mysql"));
+    }
+
+    #[test]
+    fn losing_the_daemon_while_a_menu_is_open_does_not_empty_the_list_under_it() {
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Update::Services(vec![
+            service("mysql", 3306, true),
+            service("redis", 6379, true),
+        ]));
+        dashboard.focus_on(Pane::Services);
+        dashboard.move_selection(1);
+        dashboard.open_menu("redis", vec![MenuItem::new("stop it", 'x')]);
+
+        dashboard.apply(Update::ServicesFailed("connection refused".to_string()));
+
+        assert_eq!(
+            dashboard.selected_service().map(|s| s.service.as_str()),
+            Some("redis"),
+            "the row the menu is about has to survive the daemon going away, \
+             or the action lands on whatever slid into its place"
+        );
+    }
 }

@@ -916,4 +916,121 @@ mod tests {
     fn stats_that_cannot_be_read_are_absent_rather_than_an_error() {
         assert_eq!(parse_memory("not json"), None);
     }
+
+    /// A daemon that says exactly one thing and then goes away.
+    ///
+    /// Every other test here hands a parser a string. These hand the client a
+    /// socket, which is the only way to cover what sits between: the URL it
+    /// builds, the request it writes, the status it reads, and what it does
+    /// with a body that is not what it hoped for. That layer is what would
+    /// break against somebody else's docker, and it had no test at all.
+    fn fake_daemon(
+        status: &str,
+        body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = listener.local_addr().unwrap().port();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        // What the client actually asked for. Nothing else here can see the
+        // URL that gets built, and a wrong one against a real daemon comes
+        // back as a 404 that points nowhere near this code.
+        let (asked, heard) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            // One request, then done: every test here makes exactly one.
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{BufRead, BufReader, Write};
+                // The request has to be read before answering, or the client
+                // sees the connection close under its own write.
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let mut first = None;
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if first.is_none() {
+                        first = Some(line.trim_end().to_string());
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                let _ = asked.send(first.unwrap_or_default());
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        (format!("tcp://127.0.0.1:{port}"), heard)
+    }
+
+    #[test]
+    fn a_listing_travels_from_a_socket_to_services() {
+        let (endpoint, asked) = fake_daemon(
+            "200 OK",
+            r#"[{"Names":["/mysql-db"],"State":"running","Image":"mysql:8",
+                 "Labels":{"com.docker.compose.service":"mysql"},
+                 "Ports":[{"PublicPort":3306,"Type":"tcp"}]}]"#,
+        );
+        let client = HttpDockerClient::new(&endpoint, None).expect("an endpoint");
+
+        let services = client.services().expect("a listing");
+
+        assert_eq!(
+            asked.recv().unwrap(),
+            "GET /containers/json?all=true HTTP/1.1",
+            "the path and the query, which nothing else here can see"
+        );
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].service, "mysql");
+        assert_eq!(services[0].container, "mysql-db");
+        assert_eq!(services[0].port, Some(3306));
+        assert_eq!(services[0].state, ServiceState::Running);
+    }
+
+    #[test]
+    fn a_daemon_that_answers_with_an_error_is_not_read_as_an_empty_listing() {
+        let (endpoint, _asked) = fake_daemon("500 Internal Server Error", r#"{"message":"boom"}"#);
+        let client = HttpDockerClient::new(&endpoint, None).unwrap();
+
+        let outcome = client.services();
+        assert!(
+            outcome.is_err(),
+            "a daemon in trouble reporting nothing running is the lie this \
+             whole project exists to stop telling"
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_the_shape_expected_is_an_error_with_the_reason() {
+        let (endpoint, _asked) = fake_daemon("200 OK", r#"{"not":"a list"}"#);
+        let client = HttpDockerClient::new(&endpoint, None).unwrap();
+
+        let error = client.services().unwrap_err().to_string();
+        assert!(
+            !error.is_empty(),
+            "a docker that answers in a shape this does not know has to say so"
+        );
+    }
+
+    #[test]
+    fn a_socket_that_answers_nothing_at_all_is_reported_as_unreachable() {
+        // Bound and dropped: the port is closed, so connecting fails outright.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let client = HttpDockerClient::new(&format!("tcp://127.0.0.1:{port}"), None).unwrap();
+        let error = client.services().unwrap_err();
+        assert!(
+            matches!(error, DockerError::Unreachable { .. }),
+            "got {error:?}"
+        );
+        assert!(
+            error.to_string().contains(&port.to_string()),
+            "and it names what it could not reach: {error}"
+        );
+    }
 }
