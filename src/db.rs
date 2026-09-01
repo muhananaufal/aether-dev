@@ -331,6 +331,20 @@ pub fn backup_filename(service: &str, engine: Engine, gzip: bool) -> String {
         Engine::MySql | Engine::Postgres => "sql",
         Engine::Mongo => "archive",
     };
+    // The name comes from a container label rather than from a prompt, but it
+    // still becomes a file name, and a label is not a thing this tool decides.
+    // Anything that could be read as a path separator becomes an underscore,
+    // so a backup always lands in the directory it was asked to land in.
+    let service: String = service
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     if gzip {
         format!("{service}.{extension}.gz")
     } else {
@@ -765,6 +779,24 @@ mod tests {
             backup_filename("m", Engine::Mongo, false),
             "m.archive",
             "a mongo dump is not sql and should not pretend to be"
+        );
+    }
+
+    #[test]
+    fn a_service_name_cannot_send_its_backup_up_a_directory() {
+        // Compose labels are not something this tool decides, and they end up
+        // in a file name. A backup has to land where it was asked to.
+        for hostile in ["../escaped", r"..\escaped", "a/b"] {
+            let named = backup_filename(hostile, Engine::MySql, false);
+            assert!(
+                !named.contains('/') && !named.contains('\\'),
+                "{hostile:?} became {named:?}, which is a path rather than a name"
+            );
+        }
+        assert_eq!(
+            backup_filename("ticketing_postgres", Engine::Postgres, false),
+            "ticketing_postgres.sql",
+            "and an ordinary name is left exactly as it is"
         );
     }
 }
