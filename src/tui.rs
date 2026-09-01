@@ -284,6 +284,9 @@ pub struct Dashboard {
     /// underneath are held still, so the row it was opened on is the row the
     /// chosen action reaches.
     menu: Option<Menu>,
+    /// What to tell somebody whose dashboard is empty. Set by the caller,
+    /// which is the only side that knows whether a configuration was found.
+    guidance: Option<String>,
     /// What the container host is costing this machine. Polled on its own
     /// timer, so a slow probe cannot hold up the rest of the screen.
     memory: memory::Reading,
@@ -316,6 +319,7 @@ impl Dashboard {
             confirm: None,
             prompt: None,
             menu: None,
+            guidance: None,
             memory: memory::Reading::default(),
             ports: Vec::new(),
             ports_error: None,
@@ -376,6 +380,23 @@ impl Dashboard {
         if let Some(view) = self.logs.as_mut() {
             let furthest = view.lines.len().saturating_sub(1) as isize;
             view.scroll = (view.scroll as isize - delta).clamp(0, furthest) as usize;
+        }
+    }
+
+    /// What to say when the dashboard has nothing to show. The caller supplies
+    /// it because only that side knows whether a configuration was found.
+    pub fn set_guidance(&mut self, guidance: Option<String>) {
+        self.guidance = guidance;
+    }
+
+    /// The advice, but only while it still applies: after the scan finished
+    /// and found nothing. Earlier it would be telling somebody to fix a scan
+    /// that is still running; later it would be advice already taken.
+    fn guidance_now(&self) -> Option<&str> {
+        if self.projects.is_empty() && self.scanned.is_some() {
+            self.guidance.as_deref()
+        } else {
+            None
         }
     }
 
@@ -757,6 +778,24 @@ impl Dashboard {
             .row_highlight_style(highlight);
 
         frame.render_stateful_widget(table, area, &mut self.tables[index]);
+
+        // An empty pane is where somebody who just installed this stops, so
+        // the reason it is empty goes inside it - wrapped across the whole
+        // width, which a table column cannot do.
+        if pane == Pane::Projects {
+            if let Some(advice) = self.guidance_now() {
+                let inside = area.inner(Margin {
+                    vertical: 2,
+                    horizontal: 2,
+                });
+                frame.render_widget(
+                    Paragraph::new(advice.to_string())
+                        .style(Style::default().fg(paint::WAITING))
+                        .wrap(ratatui::widgets::Wrap { trim: true }),
+                    inside,
+                );
+            }
+        }
 
         // Only when there is more than fits: a scrollbar on a list you can see
         // all of takes a column and says nothing.
@@ -1703,6 +1742,47 @@ mod tests {
             dashboard.take_typed(),
             Some(String::new()),
             "enter on an empty prompt is a decision, not a cancellation"
+        );
+    }
+
+    #[test]
+    fn an_empty_projects_pane_says_what_to_do_about_it() {
+        let mut dashboard = Dashboard::new();
+        dashboard.set_guidance(Some(
+            "no configuration found · press g, then run adev config --init".to_string(),
+        ));
+        dashboard.apply(Update::ScanFinished { scanned: 0 });
+        dashboard.apply(Update::Services(Vec::new()));
+
+        let view = screen(&drawn(&mut dashboard, 140, 20));
+        assert!(
+            view.contains("adev config --init"),
+            "an empty dashboard with no explanation is where a new user stops; got {view}"
+        );
+    }
+
+    #[test]
+    fn guidance_disappears_once_there_is_something_to_show() {
+        let mut dashboard = with_projects(2);
+        dashboard.set_guidance(Some("run adev config --init".to_string()));
+        dashboard.apply(Update::ScanFinished { scanned: 2 });
+
+        let view = screen(&drawn(&mut dashboard, 140, 20));
+        assert!(
+            !view.contains("adev config --init"),
+            "advice that stays after it has been taken is noise; got {view}"
+        );
+    }
+
+    #[test]
+    fn a_scan_still_running_is_not_mistaken_for_an_empty_one() {
+        let mut dashboard = Dashboard::new();
+        dashboard.set_guidance(Some("run adev config --init".to_string()));
+        // No ScanFinished yet: the collectors are still working.
+        let view = screen(&drawn(&mut dashboard, 140, 20));
+        assert!(
+            !view.contains("adev config --init"),
+            "telling somebody to configure it while it is still looking is wrong; got {view}"
         );
     }
 

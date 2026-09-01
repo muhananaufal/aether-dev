@@ -78,7 +78,7 @@ fn main() -> ExitCode {
     };
 
     match cli.command {
-        Command::Scan { json } => scan(&config, json),
+        Command::Scan { json } => scan(&config, json, chosen.as_deref()),
         Command::Services { json, memory } => services(&config, json, memory),
         Command::Ports { json } => ports(&config, json),
         Command::Kill { port, dry_run } => kill(port, dry_run),
@@ -122,7 +122,7 @@ struct Failure<'a> {
     reason: &'a str,
 }
 
-fn scan(config: &Config, json: bool) -> ExitCode {
+fn scan(config: &Config, json: bool, chosen: Option<&Path>) -> ExitCode {
     let started = Instant::now();
     let scanner =
         FsProjectScanner::new(GitCli::new(config.scan.git_timeout_ms), config.scan.workers);
@@ -188,7 +188,53 @@ fn scan(config: &Config, json: bool) -> ExitCode {
         outcome.failures.len(),
         elapsed.as_secs_f64()
     );
+
+    // A scan that finds nothing is where somebody who just installed this
+    // stops. The counts alone do not say whether the tool is broken, whether
+    // it looked somewhere else, or whether there is genuinely nothing there.
+    if outcome.projects.is_empty() {
+        for line in nothing_found(config, chosen) {
+            outln!("{line}");
+        }
+    }
     ExitCode::SUCCESS
+}
+
+/// What to say when a scan comes back empty.
+///
+/// Facts first: which directories, and what named them. The suggestion goes
+/// last and only when no configuration file was found at all - somebody who
+/// has one and meant to scan an empty directory does not need setting up.
+fn nothing_found(config: &Config, chosen: Option<&Path>) -> Vec<String> {
+    let roots: Vec<String> = config
+        .project
+        .roots
+        .iter()
+        .map(|root| {
+            std::fs::canonicalize(root)
+                .unwrap_or_else(|_| root.clone())
+                .display()
+                .to_string()
+                // Windows hands back an extended-length path, which is correct
+                // and unreadable.
+                .replace(r"\\?\", "")
+        })
+        .collect();
+
+    let mut lines = vec![format!("looked in {}", roots.join(", "))];
+    match chosen {
+        Some(path) => lines.push(format!("as {} says to", path.display())),
+        None => {
+            lines.push("no configuration file was found, so that is the default".to_string());
+            lines.push(String::new());
+            lines.push(
+                "adev config --init writes one describing this machine, which is the \
+                 quickest way to point this at your projects"
+                    .to_string(),
+            );
+        }
+    }
+    lines
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -990,6 +1036,21 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
     let mut pending: Option<Pending> = None;
     let mut asking: Option<Asking> = None;
     dashboard.set_settings(settings_lines(config, chosen));
+    // Only when nothing was found on disk. Somebody who has a configuration
+    // and an empty root does not need to be told how to write one.
+    dashboard.set_guidance(chosen.is_none().then(|| {
+        format!(
+            "Nothing to show yet. This looked in {} because no configuration file was found.\n\n\
+             Quit with q, then run  adev config --init  to write one describing this machine.",
+            config
+                .project
+                .roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }));
 
     let outcome: std::io::Result<Leave> = ratatui::run(|terminal| {
         loop {
