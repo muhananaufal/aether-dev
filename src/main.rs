@@ -1941,26 +1941,38 @@ fn env(config: &Config, project: &str) -> ExitCode {
 ///
 /// In front rather than instead: a project needs its own PHP, but it still
 /// needs git, and the tools it shells out to.
-fn path_with(resolved: &[(String, Resolution)]) -> Result<std::ffi::OsString, ExitCode> {
+///
+/// The order is the whole point of this tool. A project pinned to PHP 7.4 on a
+/// machine whose PATH already starts with 8.2 has to find 7.4 first; appended
+/// instead of prepended, everything would quietly keep using the system
+/// version - working, wrong, and invisible. Taking the existing PATH as an
+/// argument is what lets that be checked.
+fn path_ordered(
+    resolved: &[(String, Resolution)],
+    existing: Option<&std::ffi::OsStr>,
+) -> Result<std::ffi::OsString, String> {
     let mut entries: Vec<PathBuf> = Vec::new();
     for (tool, resolution) in resolved {
         match &resolution.chosen {
             Some(chosen) => entries.push(chosen.path.clone()),
             None => {
-                eprintln!(
-                    "adev: no usable {tool}: {} ({})",
+                return Err(format!(
+                    "no usable {tool}: {} ({})",
                     why(resolution.reason),
                     resolution.constraint.as_deref().unwrap_or("no constraint")
-                );
-                return Err(ExitCode::from(2));
+                ))
             }
         }
     }
-    if let Some(existing) = std::env::var_os("PATH") {
-        entries.extend(std::env::split_paths(&existing));
+    if let Some(existing) = existing {
+        entries.extend(std::env::split_paths(existing));
     }
-    std::env::join_paths(entries).map_err(|error| {
-        eprintln!("adev: cannot build a PATH: {error}");
+    std::env::join_paths(entries).map_err(|error| format!("cannot build a PATH: {error}"))
+}
+
+fn path_with(resolved: &[(String, Resolution)]) -> Result<std::ffi::OsString, ExitCode> {
+    path_ordered(resolved, std::env::var_os("PATH").as_deref()).map_err(|reason| {
+        eprintln!("adev: {reason}");
         ExitCode::from(2)
     })
 }
@@ -3888,6 +3900,86 @@ mod tests {
                 .to_string_lossy()
                 .ends_with("shop.sql.gz"),
             "a compressed dump named .sql would lie about what is in it"
+        );
+    }
+
+    fn resolved(tool: &str, directory: &str) -> (String, Resolution) {
+        (
+            tool.to_string(),
+            Resolution {
+                chosen: Some(aether_dev::toolchain::Installed {
+                    label: format!("{tool}-fixture"),
+                    version: semver::Version::new(7, 4, 33),
+                    path: PathBuf::from(directory),
+                }),
+                constraint: None,
+                reason: Reason::Declared,
+            },
+        )
+    }
+
+    #[test]
+    fn a_projects_own_toolchain_comes_before_the_one_already_on_path() {
+        let existing = std::env::join_paths([PathBuf::from("/usr/bin"), PathBuf::from("/php82")])
+            .expect("a path");
+        let built =
+            path_ordered(&[resolved("php", "/php74")], Some(existing.as_os_str())).expect("a path");
+
+        let entries: Vec<PathBuf> = std::env::split_paths(&built).collect();
+        assert_eq!(
+            entries.first(),
+            Some(&PathBuf::from("/php74")),
+            "a project pinned to 7.4 on a machine whose PATH starts with 8.2 \
+             must find 7.4 first; appended instead of prepended, everything \
+             quietly keeps using the system version"
+        );
+        assert!(
+            entries.contains(&PathBuf::from("/usr/bin")),
+            "in front of the existing path, not instead of it: the project \
+             still needs git and everything else it shells out to"
+        );
+    }
+
+    #[test]
+    fn several_toolchains_keep_the_order_they_were_resolved_in() {
+        let built = path_ordered(
+            &[resolved("node", "/node14"), resolved("php", "/php74")],
+            None,
+        )
+        .unwrap();
+        let entries: Vec<PathBuf> = std::env::split_paths(&built).collect();
+        assert_eq!(
+            entries,
+            vec![PathBuf::from("/node14"), PathBuf::from("/php74")]
+        );
+    }
+
+    #[test]
+    fn a_toolchain_that_resolved_to_nothing_stops_the_run_and_says_which() {
+        let missing = (
+            "php".to_string(),
+            Resolution {
+                chosen: None,
+                constraint: Some("^7.4".to_string()),
+                reason: Reason::Declared,
+            },
+        );
+        let refused = path_ordered(&[missing], None).unwrap_err();
+        assert!(
+            refused.contains("php") && refused.contains("7.4"),
+            "running on the wrong version silently is worse than not running; \
+             got {refused}"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_toolchains_runs_on_the_path_it_already_had() {
+        let existing = std::env::join_paths([PathBuf::from("/usr/bin")]).unwrap();
+        let built = path_ordered(&[], Some(existing.as_os_str())).unwrap();
+        assert_eq!(
+            std::env::split_paths(&built).collect::<Vec<_>>(),
+            vec![PathBuf::from("/usr/bin")],
+            "nothing configured means nothing changed, not an empty PATH"
         );
     }
 }

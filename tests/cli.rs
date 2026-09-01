@@ -308,3 +308,78 @@ fn help_lists_the_commands_so_the_binary_can_explain_itself() {
         assert!(text.contains(command), "{command} missing from --help");
     }
 }
+
+#[test]
+fn exec_puts_the_projects_own_toolchain_at_the_front_of_the_path_it_runs_with() {
+    let root = tempfile::tempdir().unwrap();
+
+    // A project that says it is Go, and two Go installs to choose between.
+    let project = root.path().join("projects").join("gosvc");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("go.mod"),
+        "module example.com/gosvc\n\ngo 1.21\n",
+    )
+    .unwrap();
+
+    for version in ["go1.21.6", "go1.24.0"] {
+        let bin = root.path().join("toolchains").join(version).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(if cfg!(windows) { "go.exe" } else { "go" }), "").unwrap();
+    }
+
+    let slash = |p: std::path::PathBuf| p.display().to_string().replace('\\', "/");
+    std::fs::write(
+        root.path().join("aether.toml"),
+        format!(
+            "[project]\nroots = [{:?}]\n\n\
+             [toolchain.go]\nsearch = [{:?}]\nbinary = {:?}\nbin_subdir = \"bin\"\nwhen = [\"go.mod\"]\n\n\
+             [pin.gosvc]\ngo = \"1.21.6\"\n",
+            slash(root.path().join("projects")),
+            slash(root.path().join("toolchains")),
+            if cfg!(windows) { "go.exe" } else { "go" },
+        ),
+    )
+    .unwrap();
+
+    // Ask the child what PATH it was handed. Nothing is installed and nothing
+    // is started: the command only prints its own environment.
+    let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/C", "set", "PATH"])
+    } else {
+        ("sh", vec!["-c", "echo $PATH"])
+    };
+    let mut arguments = vec!["--config", "aether.toml", "exec", "gosvc", "--", program];
+    arguments.extend(args);
+
+    let output = run(root.path(), &arguments);
+    let text = stdout(&output);
+    assert!(
+        output.status.success(),
+        "stdout: {text}\nstderr: {}",
+        stderr(&output)
+    );
+
+    let wanted = slash(root.path().join("toolchains").join("go1.21.6").join("bin"));
+    let first = text
+        .lines()
+        .find(|line| line.to_ascii_uppercase().contains("PATH"))
+        .unwrap_or(&text)
+        .to_string();
+    let first = first.replace('\\', "/");
+    assert!(
+        first.contains(&wanted),
+        "the pinned toolchain has to be on the PATH the child runs with.\n\
+         wanted: {wanted}\ngot: {first}"
+    );
+
+    // And it has to be in front. Anything behind the system PATH is a version
+    // nobody will ever reach.
+    let position = first.find(&wanted).unwrap();
+    let prefix = &first[..position];
+    assert!(
+        !prefix.to_ascii_lowercase().contains("system32"),
+        "the project's own toolchain sits behind the system path, which is the \
+         same as not being there at all.\ngot: {first}"
+    );
+}
