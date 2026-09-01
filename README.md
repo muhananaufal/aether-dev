@@ -15,9 +15,13 @@ Every capability is a command first. The dashboard is a layer on top of the
 same functions, so anything you can do on screen you can also put in a script
 or a scheduler.
 
-**Status: early. Every command works and is used daily on the author's
-machine, but it has run on exactly one setup so far — Windows with Docker
-inside WSL. Expect the rough edges of a tool that has met one environment.**
+**Status: early. Every command works and is used daily on one setup — Windows
+with Docker inside WSL. CI builds it and runs the tests on Linux and macOS,
+and the released Linux binary has been run on a real system: it lists ports
+through both `ss` and `netstat`, which agree, and the platform defaults come
+out right. macOS is compiled and tested but has never been run by anybody.
+Expect the rough edges of a tool that has met two environments and been lived
+in on one.**
 
 ## Installing
 
