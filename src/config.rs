@@ -127,8 +127,6 @@ pub struct ScanConfig {
     /// A repository that takes longer than this is reported as unknown rather
     /// than allowed to stall the scan.
     pub git_timeout_ms: u64,
-    /// How long a completed scan stays fresh before it is worth repeating.
-    pub cache_ttl_secs: u64,
 }
 
 impl Default for ScanConfig {
@@ -136,7 +134,6 @@ impl Default for ScanConfig {
         Self {
             workers: 12,
             git_timeout_ms: 2000,
-            cache_ttl_secs: 30,
         }
     }
 }
@@ -434,7 +431,6 @@ mod tests {
         let cfg = Config::from_toml_str("[scan]\nworkers = 4\n").unwrap();
         let defaults = Config::default();
         assert_eq!(cfg.scan.workers, 4);
-        assert_eq!(cfg.scan.cache_ttl_secs, defaults.scan.cache_ttl_secs);
         assert_eq!(cfg.project.roots, defaults.project.roots);
         assert_eq!(cfg.docker.endpoint, defaults.docker.endpoint);
     }
