@@ -176,7 +176,9 @@ fn scan(config: &Config, json: bool, chosen: Option<&Path>) -> ExitCode {
         );
     }
     for (path, reason) in &outcome.failures {
-        outln!("{:<30} {} ({})", "! unreadable", path.display(), reason);
+        // "skipped", not "failed": the commonest cause is a root on a drive
+        // that is not plugged in, and calling that a failure reads as damage.
+        outln!("{:<30} {} ({})", "! skipped", path.display(), reason);
     }
 
     // The denominator is printed on purpose: "no projects" and "nothing was
@@ -185,7 +187,7 @@ fn scan(config: &Config, json: bool, chosen: Option<&Path>) -> ExitCode {
         .scanned
         .map_or_else(|| "?".to_string(), |count| count.to_string());
     outln!(
-        "\n{} projects, {} failures, {examined} directories examined in {:.2}s",
+        "\n{} projects, {} roots skipped, {examined} directories examined in {:.2}s",
         outcome.projects.len(),
         outcome.failures.len(),
         elapsed.as_secs_f64()
