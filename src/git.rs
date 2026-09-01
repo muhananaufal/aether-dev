@@ -73,11 +73,17 @@ pub fn read_branch(path: &Path) -> Option<String> {
 /// Reads status by running `git status --porcelain`.
 pub struct GitCli {
     timeout_ms: u64,
+    /// The git to run. A bare "git" is found on PATH, which is right almost
+    /// always and wrong on a machine with more than one.
+    program: String,
 }
 
 impl GitCli {
-    pub fn new(timeout_ms: u64) -> Self {
-        Self { timeout_ms }
+    pub fn new(timeout_ms: u64, program: impl Into<String>) -> Self {
+        Self {
+            timeout_ms,
+            program: program.into(),
+        }
     }
 }
 
@@ -92,9 +98,10 @@ impl GitReader for GitCli {
         // and let it exit on its own. Blocking here is what froze the tool
         // this one replaces.
         let dir = path.to_path_buf();
+        let program = self.program.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = Command::new("git")
+            let result = Command::new(&program)
                 .args(["-C", &dir.to_string_lossy(), "status", "--porcelain"])
                 .output();
             let _ = tx.send(result);
