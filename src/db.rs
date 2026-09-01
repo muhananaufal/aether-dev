@@ -218,10 +218,12 @@ fn value_of(env: &[String], key: &str) -> Option<String> {
     })
 }
 
-/// The name becomes an argument to a command running as root inside the
 /// container, so anything that could be read as another argument is refused
 /// rather than escaped.
-fn validated_database(database: &str) -> Result<String, DbError> {
+/// The name becomes both an argument to a command running as root inside the
+/// container and part of a file name on this machine, so anything that could
+/// be read as another argument - or as a path - is refused rather than escaped.
+pub fn validated_database(database: &str) -> Result<String, DbError> {
     let usable = !database.is_empty()
         && !database.starts_with('-')
         && database

@@ -720,15 +720,34 @@ enum Asking {
     ExecCommand { project: String },
 }
 
+/// Where a dump of one database goes, refusing a name that would put it
+/// somewhere else.
+///
+/// The name is typed at a prompt and becomes part of a path, so it is checked
+/// here. It used to be checked only inside `dump_plan`, which runs after the
+/// directory has been created - so a name like `../../elsewhere/db` made
+/// directories outside the backup folder and only then refused the dump.
+fn dump_path(config: &Config, database: &str) -> Result<PathBuf, String> {
+    aether_dev::db::validated_database(database).map_err(|error| error.to_string())?;
+    let extension = if config.backup.gzip { "sql.gz" } else { "sql" };
+    Ok(config
+        .backup
+        .directory
+        .join(format!("{database}.{extension}")))
+}
+
 /// Writes one database to a file for the dashboard, off the draw loop.
 fn spawn_export(config: &Config, service: String, database: String, updates: Sender<Update>) {
     let endpoint = config.docker.endpoint.clone();
     let docker_host = std::env::var("DOCKER_HOST").ok();
-    let extension = if config.backup.gzip { "sql.gz" } else { "sql" };
-    let out = config
-        .backup
-        .directory
-        .join(format!("{database}.{extension}"));
+    let out = match dump_path(config, &database) {
+        Ok(out) => out,
+        // Refused before anything is created, rather than after.
+        Err(reason) => {
+            let _ = updates.send(Update::Notice(Notice::failed(reason)));
+            return;
+        }
+    };
     let gzip = config.backup.gzip;
     let owned = config.clone();
 
@@ -3783,6 +3802,77 @@ mod tests {
             keys.last_notice().as_deref(),
             Some("rereading ports"),
             "the pane names the container behind each port, so both are reread"
+        );
+    }
+
+    #[test]
+    fn a_database_name_cannot_put_its_dump_outside_the_backup_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = harmless(dir.path());
+
+        for hostile in [
+            "../../elsewhere/db",
+            r"..\..\elsewhere\db",
+            "/etc/passwd",
+            "sub/dir",
+            "db.sql",
+        ] {
+            let refused = dump_path(&config, hostile);
+            assert!(
+                refused.is_err(),
+                "{hostile:?} would have been written somewhere nobody asked for"
+            );
+        }
+
+        let allowed = dump_path(&config, "shop_db").expect("an ordinary name");
+        assert_eq!(
+            allowed.parent(),
+            Some(config.backup.directory.as_path()),
+            "and an ordinary one lands where the configuration says"
+        );
+    }
+
+    #[test]
+    fn exporting_a_hostile_name_creates_nothing_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut keys = Keyboard::new().with_a_service();
+        keys.config = harmless(dir.path());
+
+        keys.press(KeyCode::Char('E'));
+        keys.type_in("../../escaped");
+        keys.press(KeyCode::Enter);
+
+        // The refusal travels back through the channel from the thread, so
+        // give it a moment rather than racing it.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let said = keys.last_notice().unwrap_or_default();
+        assert!(
+            said.contains("escaped") || said.contains("usable database name"),
+            "the refusal names what was asked for; got {said}"
+        );
+        assert!(
+            !dir.path().join("..").join("escaped.sql").exists(),
+            "and nothing was written outside the directory"
+        );
+    }
+
+    #[test]
+    fn the_extension_follows_whether_dumps_are_compressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = harmless(dir.path());
+
+        assert!(dump_path(&config, "shop")
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("shop.sql"));
+
+        config.backup.gzip = true;
+        assert!(
+            dump_path(&config, "shop")
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("shop.sql.gz"),
+            "a compressed dump named .sql would lie about what is in it"
         );
     }
 }
