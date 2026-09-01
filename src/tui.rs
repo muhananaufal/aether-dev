@@ -13,6 +13,7 @@
 use crate::domain::{GitStatus, Project, ServiceState, ServiceStatus};
 use crate::listen::Listener;
 use crate::memory;
+use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -116,6 +117,80 @@ pub enum Update {
         container: String,
         line: String,
     },
+}
+
+/// Which of the things on screen a keystroke belongs to.
+///
+/// The dashboard stacks up: panes, then a log over them, then a menu, then a
+/// line being typed, then a question. Only one of them gets the key, and the
+/// order decides which. It was written straight into the event loop as four
+/// early returns, where the one thing nobody could check was whether the order
+/// was right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    Confirm,
+    Prompt,
+    Menu,
+    Logs,
+    Panes,
+}
+
+/// What a key means to a line being typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Editing {
+    Type(char),
+    Backspace,
+    Accept,
+    Cancel,
+    Ignore,
+}
+
+/// What a key means to an open menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuKey {
+    Up,
+    Down,
+    Choose,
+    Close,
+    Ignore,
+}
+
+/// Whether a key answers a yes-or-no question with yes.
+///
+/// Only an explicit y. Anything else - a stray arrow, an enter meant for the
+/// list behind the question - is a no, so no single keystroke destroys
+/// something by accident.
+pub fn is_yes(key: KeyCode) -> bool {
+    matches!(key, KeyCode::Char('y') | KeyCode::Char('Y'))
+}
+
+/// What a key does to a line being typed.
+///
+/// Every character lands in the line, including `j`, `k` and `q`. A prompt
+/// that let those through would move a list behind it instead of spelling a
+/// database name.
+pub fn editing(key: KeyCode) -> Editing {
+    match key {
+        KeyCode::Char(c) => Editing::Type(c),
+        KeyCode::Backspace => Editing::Backspace,
+        KeyCode::Enter => Editing::Accept,
+        KeyCode::Esc => Editing::Cancel,
+        _ => Editing::Ignore,
+    }
+}
+
+/// What a key does to an open menu.
+pub fn menu_key(key: KeyCode) -> MenuKey {
+    match key {
+        KeyCode::Down | KeyCode::Char('j') => MenuKey::Down,
+        KeyCode::Up | KeyCode::Char('k') => MenuKey::Up,
+        KeyCode::Enter => MenuKey::Choose,
+        // q closes the menu rather than quitting: leaving somebody's whole
+        // dashboard because they wanted to back out of a list is not a
+        // reasonable reading of one keypress.
+        KeyCode::Esc | KeyCode::Char('q') => MenuKey::Close,
+        _ => MenuKey::Ignore,
+    }
 }
 
 /// One thing you can do to the row a menu was opened on.
@@ -429,6 +504,29 @@ impl Dashboard {
 
     pub fn showing_detail(&self) -> bool {
         self.detail.is_some()
+    }
+
+    /// Which of the things on screen the next key belongs to.
+    ///
+    /// A question first, because it is the only one whose wrong answer cannot
+    /// be undone; then whatever is being typed, so a letter never reaches a
+    /// list; then a menu, then a log, then the panes.
+    pub fn layer(&self) -> Layer {
+        if self.confirm.is_some() {
+            Layer::Confirm
+        } else if self.prompt.is_some() {
+            Layer::Prompt
+        } else if self.logs.is_some() {
+            // Before the menu, matching the loop this was taken from. The two
+            // cannot both be open - a log takes every key, so no menu can be
+            // opened over one - but where the code and its description
+            // disagree, the code is what runs.
+            Layer::Logs
+        } else if self.menu.is_some() {
+            Layer::Menu
+        } else {
+            Layer::Panes
+        }
     }
 
     /// Opens the list of what can be done to the selected row.
@@ -1783,6 +1881,85 @@ mod tests {
         assert!(
             !view.contains("adev config --init"),
             "telling somebody to configure it while it is still looking is wrong; got {view}"
+        );
+    }
+
+    #[test]
+    fn a_question_outranks_everything_else_that_could_be_open() {
+        let mut dashboard = Dashboard::new();
+        assert_eq!(dashboard.layer(), Layer::Panes);
+
+        dashboard.open_menu("mysql", menu_items());
+        assert_eq!(dashboard.layer(), Layer::Menu);
+
+        dashboard.open_logs("mysql".to_string());
+        assert_eq!(
+            dashboard.layer(),
+            Layer::Logs,
+            "a log outranks a menu, which is the order the event loop reads \
+             them in - the two never coexist, but a description that disagrees \
+             with the code is worse than no description"
+        );
+
+        dashboard.ask_for("which database");
+        assert_eq!(dashboard.layer(), Layer::Prompt, "typing covers both");
+
+        dashboard.ask("kill it?");
+        assert_eq!(
+            dashboard.layer(),
+            Layer::Confirm,
+            "and a question about something irreversible covers everything"
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_yes_answers_a_question() {
+        assert!(is_yes(KeyCode::Char('y')));
+        assert!(is_yes(KeyCode::Char('Y')));
+        // Everything else, including keys meant for the screen behind the
+        // question, is a no. There is no keystroke that destroys something by
+        // accident.
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Char('n'),
+            KeyCode::Esc,
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ] {
+            assert!(!is_yes(key), "{key:?} must not mean yes");
+        }
+    }
+
+    #[test]
+    fn typing_a_letter_reaches_the_prompt_and_does_not_move_a_list() {
+        assert_eq!(editing(KeyCode::Char('j')), Editing::Type('j'));
+        assert_eq!(editing(KeyCode::Char('q')), Editing::Type('q'));
+        assert_eq!(editing(KeyCode::Backspace), Editing::Backspace);
+        assert_eq!(editing(KeyCode::Enter), Editing::Accept);
+        assert_eq!(editing(KeyCode::Esc), Editing::Cancel);
+        // Arrows mean nothing in a one-line prompt, and must not fall through
+        // to the panes behind it.
+        assert_eq!(editing(KeyCode::Down), Editing::Ignore);
+    }
+
+    #[test]
+    fn a_menu_takes_the_movement_keys_and_leaves_the_rest_alone() {
+        assert_eq!(menu_key(KeyCode::Char('j')), MenuKey::Down);
+        assert_eq!(menu_key(KeyCode::Down), MenuKey::Down);
+        assert_eq!(menu_key(KeyCode::Char('k')), MenuKey::Up);
+        assert_eq!(menu_key(KeyCode::Up), MenuKey::Up);
+        assert_eq!(menu_key(KeyCode::Enter), MenuKey::Choose);
+        assert_eq!(
+            menu_key(KeyCode::Char('q')),
+            MenuKey::Close,
+            "q closes the menu rather than quitting the whole dashboard"
+        );
+        assert_eq!(menu_key(KeyCode::Esc), MenuKey::Close);
+        assert_eq!(
+            menu_key(KeyCode::Char('s')),
+            MenuKey::Ignore,
+            "a shortcut pressed with a menu open is a slip, not a command for \
+             the screen behind it"
         );
     }
 

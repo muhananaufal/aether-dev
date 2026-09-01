@@ -1,0 +1,47 @@
+name: It does not work on my platform
+description: Something this cannot do on Linux or macOS, or does differently there
+labels: ["platform"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Known gaps, so you can tell whether yours is one of them:
+
+        - **macOS has no port probe.** `adev ports` says which setting to fill
+          in rather than guessing, because no capture of a real machine's
+          output existed to write a parser against. If you are on macOS, the
+          output of `lsof -nP -iTCP -sTCP:LISTEN` in the box below is enough to
+          fix that for everybody.
+        - **On Linux, process names need root.** `ss` and `netstat` both refuse
+          to name processes they do not own, so the columns read `-`. That is
+          the system being careful, not a bug — but if you know a way around it
+          that does not involve running the whole tool as root, say so.
+        - **The dashboard has only ever been looked at in Windows Terminal.**
+          Anything that draws wrongly elsewhere is worth reporting, with a
+          screenshot if you can.
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: macOS 15.2 on Apple silicon, Ghostty
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What it does, and what it should do
+    validations:
+      required: true
+
+  - type: textarea
+    id: raw
+    attributes:
+      label: Raw output of the tool it would need
+      description: >
+        For a port probe, whatever your system uses to list listening sockets,
+        pasted exactly as it printed. Parsers written against a format nobody
+        captured are how the wrong one gets shipped, so this is the single most
+        useful thing you can attach.
+      render: shell

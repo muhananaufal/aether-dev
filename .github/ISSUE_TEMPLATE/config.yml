@@ -1,0 +1,10 @@
+# A blank issue stays available on purpose. A form that fits every report has
+# not been written yet, and turning somebody away because their problem has no
+# template is worse than reading a paragraph of prose.
+blank_issues_enabled: true
+contact_links:
+  - name: A question about how something works
+    url: https://github.com/muhananaufal/aether-dev/discussions
+    about: >
+      For "how do I", "should this work like this", and anything you are not
+      sure is a bug. No form, no obligation to be certain.
