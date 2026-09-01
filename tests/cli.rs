@@ -27,6 +27,12 @@ fn run(directory: &Path, arguments: &[&str]) -> Output {
         .env("APPDATA", directory.join("no-config-here"))
         .env("XDG_CONFIG_HOME", directory.join("no-config-here"))
         .env("HOME", directory.join("no-config-here"))
+        // And at no daemon. The default endpoint is "auto", which follows
+        // DOCKER_HOST, and on a developer's machine that points at a running
+        // daemon - so a test of a command that acts on containers would act on
+        // real ones. None of the tests below run such a command today; this is
+        // here so that the next one added cannot.
+        .env("DOCKER_HOST", "tcp://127.0.0.1:1")
         .output()
         .expect("the binary cargo built should be runnable")
 }
