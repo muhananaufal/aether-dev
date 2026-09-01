@@ -1,0 +1,131 @@
+name: release
+
+# Only a tag makes a release, so nothing is published by accident. Note that
+# adding this workflow does not build the tags that already exist: the first
+# artifacts appear on the next tag pushed after it.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      # One platform failing should still leave the others downloadable, and
+      # the release job below refuses to publish a partial set anyway.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          # musl rather than gnu: a binary built against the runner's glibc
+          # refuses to start on any distribution older than the runner. The
+          # whole dependency tree is pure Rust - no libc, no C - so a fully
+          # static build costs nothing here.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The version comes from the tag rather than from Cargo.toml, so a tag
+      # that disagrees with the manifest produces a name that says so instead
+      # of a file that quietly claims to be something else.
+      - name: Name it
+        id: name
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "stem=adev-${version}-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          stem="${{ steps.name.outputs.stem }}"
+          mkdir "$stem"
+          cp target/${{ matrix.target }}/release/adev "$stem/"
+          cp README.md LICENSE aether.example.toml "$stem/"
+          tar czf "$stem.tar.gz" "$stem"
+          shasum -a 256 "$stem.tar.gz" > "$stem.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          stem="${{ steps.name.outputs.stem }}"
+          mkdir "$stem"
+          cp target/${{ matrix.target }}/release/adev.exe "$stem/"
+          cp README.md LICENSE aether.example.toml "$stem/"
+          7z a "$stem.zip" "$stem" > /dev/null
+          certutil -hashfile "$stem.zip" SHA256 | sed -n 2p | tr -d ' \r' > "$stem.zip.sha256.raw"
+          echo "$(cat "$stem.zip.sha256.raw")  $stem.zip" > "$stem.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.stem }}
+          path: |
+            ${{ steps.name.outputs.stem }}.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      # A release missing a platform is worse than no release: somebody on that
+      # platform downloads nothing and cannot tell whether it is unsupported or
+      # broken. Four archives are expected; anything else stops here.
+      - name: Refuse a partial set
+        run: |
+          mkdir -p out
+          find staging -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} out/ \;
+          # Both shapes: one combined file to check a download against by hand,
+          # and one beside each archive, which is what Scoop's autoupdate reads.
+          find staging -type f -name '*.sha256' -exec cat {} \; | sort -k2 > SHA256SUMS
+          find staging -type f -name '*.sha256' -exec mv {} out/ \;
+          mv SHA256SUMS out/
+          count=$(find out -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)
+          echo "built $count archives:"
+          ls -1 out
+          test "$count" -eq 4
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            out/*

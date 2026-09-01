@@ -3,9 +3,19 @@ name = "aether-dev"
 version = "0.6.0"
 edition = "2021"
 license = "MIT"
-description = "Terminal dashboard for a local development environment"
+description = "Terminal dashboard for a local development environment: Docker services, projects, ports, and per-project toolchain versions"
 repository = "https://github.com/muhananaufal/aether-dev"
-publish = false
+readme = "README.md"
+keywords = ["tui", "docker", "dashboard", "devtools", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# The highest any dependency declares: ratatui and time both ask for 1.88.
+# Read out of their manifests rather than guessed, because a number that is too
+# low here means somebody starts a build that cannot finish, and one that is
+# too high turns people away for no reason.
+rust-version = "1.88"
+# Everything the published package does not need. A crate that ships its own CI
+# config and screenshots wastes the download of everybody who installs it.
+exclude = [".github/", "packaging/", "docs/", "*.png"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
@@ -26,3 +36,15 @@ tempfile = "3.27.0"
 [[bin]]
 name = "adev"
 path = "src/main.rs"
+
+# So `cargo binstall aether-dev` fetches the binary the release workflow built
+# instead of compiling the whole tree. The names here and the ones in
+# .github/workflows/release.yml have to agree, and there is nothing that checks
+# they do except a failed download - so change them together.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/adev-{ version }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "adev-{ version }-{ target }/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
