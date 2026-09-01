@@ -3391,4 +3391,246 @@ mod tests {
         );
         assert!(keys.pending.is_none(), "and nothing is queued up");
     }
+
+    /// A configuration that cannot touch anything outside its own directory.
+    ///
+    /// Without this a test would open a browser window, write a Caddyfile into
+    /// the repository, or restart somebody's proxy. A test that does any of
+    /// those is not a test, it is a prank.
+    fn harmless(directory: &Path) -> Config {
+        let mut config = Config::default();
+        config.caddy.domains = directory.join("domains.toml");
+        config.caddy.caddyfile = directory.join("Caddyfile");
+        config.backup.directory = directory.join("backups");
+        // Echo rather than a browser or a file manager.
+        config.open.browser = vec!["cmd".to_string(), "/C".to_string(), "echo".to_string()];
+        config.open.file_manager = config.open.browser.clone();
+        config
+    }
+
+    /// Every entry in a menu has to reach something.
+    ///
+    /// The menu names a key per entry and choosing it becomes that keystroke.
+    /// An entry naming a key with no arm behind it would do nothing at all,
+    /// silently, and look exactly like an entry that worked. That is the shape
+    /// of the bug this file was written to find, so it is worth a test that
+    /// walks every entry rather than the few somebody thought of.
+    #[test]
+    fn no_menu_entry_leads_nowhere() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for pane in [Pane::Projects, Pane::Services] {
+            let sample = {
+                let mut keys = Keyboard::new().with_a_project().with_a_service();
+                keys.dashboard.focus_on(pane);
+                menu_for(&keys.dashboard).expect("a menu for this pane").1
+            };
+
+            for (index, item) in sample.iter().enumerate() {
+                let mut keys = Keyboard::new().with_a_project().with_a_service();
+                keys.config = harmless(dir.path());
+                keys.dashboard.focus_on(pane);
+
+                keys.press(KeyCode::Enter);
+                for _ in 0..index {
+                    keys.press(KeyCode::Down);
+                }
+                let step = keys.press(KeyCode::Enter);
+
+                // Something has to have happened: the dashboard says something,
+                // asks something, shows something, or hands the terminal over.
+                let acted = matches!(step, Step::Leave(_))
+                    || keys.last_notice().is_some()
+                    || keys.dashboard.prompting().is_some()
+                    || keys.dashboard.showing_detail()
+                    || keys.dashboard.logs().is_some()
+                    || keys.dashboard.showing_help();
+                assert!(
+                    acted,
+                    "{pane:?} menu entry {index} ({:?}, key {:?}) did nothing at all",
+                    item.label, item.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn switching_dotenv_shows_the_variants_while_you_type_which_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("shop-web");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".env"), "A=1").unwrap();
+        std::fs::write(project.join(".env.staging"), "A=2").unwrap();
+
+        let mut keys = Keyboard::new();
+        keys.config = harmless(dir.path());
+        keys.dashboard.apply(Update::Project(Project {
+            name: "shop-web".to_string(),
+            category: None,
+            path: project,
+            stack: Stack::Laravel,
+            framework: None,
+            git: GitStatus::not_a_repository(),
+        }));
+        keys.dashboard.apply(Update::ScanFinished { scanned: 1 });
+        keys.dashboard.focus_on(Pane::Projects);
+
+        keys.press(KeyCode::Char('.'));
+        assert_eq!(keys.dashboard.prompting(), Some("switch .env to"));
+        assert!(
+            keys.dashboard.showing_detail(),
+            "the list is shown while the name is typed, because nobody \
+             remembers the exact spelling of every variant"
+        );
+
+        keys.type_in(".env.staging");
+        keys.press(KeyCode::Enter);
+        assert!(
+            keys.last_notice()
+                .unwrap_or_default()
+                .contains(".env.staging"),
+            "and switching says what it switched to"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_one_of_the_variants_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("shop-web");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut keys = Keyboard::new();
+        keys.config = harmless(dir.path());
+        keys.dashboard.apply(Update::Project(Project {
+            name: "shop-web".to_string(),
+            category: None,
+            path: project,
+            stack: Stack::Laravel,
+            framework: None,
+            git: GitStatus::not_a_repository(),
+        }));
+        keys.dashboard.apply(Update::ScanFinished { scanned: 1 });
+        keys.dashboard.focus_on(Pane::Projects);
+
+        keys.press(KeyCode::Char('.'));
+        keys.type_in(".env.nowhere");
+        keys.press(KeyCode::Enter);
+
+        let said = keys.last_notice().unwrap_or_default();
+        assert!(
+            said.contains(".env.nowhere"),
+            "the refusal has to name what was asked for; got {said}"
+        );
+    }
+
+    #[test]
+    fn routing_a_hostname_asks_for_the_host_then_where_it_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut keys = Keyboard::new().with_a_service();
+        keys.config = harmless(dir.path());
+
+        keys.press(KeyCode::Char('A'));
+        assert_eq!(keys.dashboard.prompting(), Some("hostname to route"));
+
+        keys.type_in("shop.test");
+        keys.press(KeyCode::Enter);
+        assert_eq!(
+            keys.dashboard.prompting(),
+            Some("pointing at (container:port)"),
+            "a hostname with nothing behind it is a route to nowhere"
+        );
+    }
+
+    #[test]
+    fn removing_a_route_asks_before_it_does_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut keys = Keyboard::new().with_a_service();
+        keys.config = harmless(dir.path());
+
+        keys.press(KeyCode::Char('X'));
+        assert_eq!(keys.dashboard.prompting(), Some("hostname to stop routing"));
+
+        keys.type_in("shop.test");
+        keys.press(KeyCode::Enter);
+        let question = keys.dashboard.confirming().unwrap_or_default().to_string();
+        assert!(
+            question.contains("shop.test"),
+            "and it names the route it is about to drop; got {question}"
+        );
+    }
+
+    #[test]
+    fn running_one_command_in_a_project_hands_the_terminal_over_with_it() {
+        let mut keys = Keyboard::new().with_a_project();
+        keys.dashboard.focus_on(Pane::Projects);
+
+        keys.press(KeyCode::Char(':'));
+        assert_eq!(keys.dashboard.prompting(), Some("command to run in it"));
+
+        keys.type_in("php -v");
+        match keys.press(KeyCode::Enter) {
+            Step::Leave(Leave::Exec(project, command)) => {
+                assert_eq!(project, "shop-web");
+                assert_eq!(command, "php -v", "whole, not split here");
+            }
+            _ => panic!("a command must take the terminal, like enter and t do"),
+        }
+    }
+
+    #[test]
+    fn the_read_only_overlays_open_and_close_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut keys = Keyboard::new().with_a_project().with_a_service();
+        keys.config = harmless(dir.path());
+
+        for (key, what) in [
+            (KeyCode::Char('g'), "settings"),
+            (KeyCode::Char('d'), "domains"),
+        ] {
+            keys.press(key);
+            assert!(keys.dashboard.showing_detail(), "{what} did not open");
+            keys.press(KeyCode::Esc);
+            assert!(!keys.dashboard.showing_detail(), "{what} did not close");
+        }
+
+        keys.dashboard.focus_on(Pane::Projects);
+        keys.press(KeyCode::Char('v'));
+        assert!(
+            keys.dashboard.showing_detail(),
+            "v shows which toolchains a project resolves to"
+        );
+    }
+
+    #[test]
+    fn moving_between_panes_keeps_each_ones_own_row() {
+        let mut keys = Keyboard::new().with_a_project().with_a_service();
+
+        keys.press(KeyCode::Char('2'));
+        assert_eq!(keys.dashboard.focus(), Pane::Services);
+        keys.press(KeyCode::Char('1'));
+        assert_eq!(keys.dashboard.focus(), Pane::Projects);
+        keys.press(KeyCode::Tab);
+        assert_eq!(keys.dashboard.focus(), Pane::Services);
+        keys.press(KeyCode::BackTab);
+        assert_eq!(keys.dashboard.focus(), Pane::Projects);
+    }
+
+    #[test]
+    fn a_log_takes_every_key_until_it_is_closed() {
+        let mut keys = Keyboard::new().with_a_service();
+
+        keys.press(KeyCode::Char('l'));
+        assert!(keys.dashboard.logs().is_some(), "l opens the log");
+
+        // A pane key while a log is open would move a list nobody can see.
+        keys.press(KeyCode::Char('1'));
+        assert_eq!(
+            keys.dashboard.focus(),
+            Pane::Services,
+            "the focus did not move behind the log"
+        );
+
+        keys.press(KeyCode::Char('l'));
+        assert!(keys.dashboard.logs().is_none(), "and l closes it again");
+    }
 }
