@@ -18,7 +18,7 @@ tar = "0.4.46"
 thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["formatting"] }
 toml = "1.1.4"
-ureq = { version = "3.4.0", features = ["json"] }
+ureq = { version = "3.4.0", default-features = false, features = ["json", "gzip"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
