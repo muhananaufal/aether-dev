@@ -3139,6 +3139,7 @@ fn on_key(
 mod tests {
     use super::*;
     use aether_dev::domain::{GitStatus, Stack};
+    use aether_dev::listen::Listener;
     use ratatui::crossterm::event::KeyModifiers;
     use std::sync::mpsc::Receiver;
 
@@ -3190,6 +3191,26 @@ mod tests {
                 memory_bytes: None,
             }]));
             self.dashboard.focus_on(Pane::Services);
+            self
+        }
+
+        /// The ports pane, which needs listeners before there is a row to
+        /// select. Two of them: one a container publishes and one nothing
+        /// owns, because the menu changes shape between them.
+        fn with_listeners(mut self) -> Self {
+            self.dashboard.apply(Update::Ports(vec![
+                Listener {
+                    port: 3306,
+                    pid: Some(1085),
+                    process: Some("docker-proxy".to_string()),
+                },
+                Listener {
+                    port: 5173,
+                    pid: None,
+                    process: None,
+                },
+            ]));
+            self.dashboard.focus_on(Pane::Ports);
             self
         }
 
@@ -3632,5 +3653,136 @@ mod tests {
 
         keys.press(KeyCode::Char('l'));
         assert!(keys.dashboard.logs().is_none(), "and l closes it again");
+    }
+
+    #[test]
+    fn no_ports_menu_entry_leads_nowhere_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let sample = {
+            let keys = Keyboard::new().with_a_service().with_listeners();
+            menu_for(&keys.dashboard)
+                .expect("a menu for the ports pane")
+                .1
+        };
+
+        for (index, item) in sample.iter().enumerate() {
+            let mut keys = Keyboard::new().with_a_service().with_listeners();
+            keys.config = harmless(dir.path());
+
+            keys.press(KeyCode::Enter);
+            for _ in 0..index {
+                keys.press(KeyCode::Down);
+            }
+            let step = keys.press(KeyCode::Enter);
+
+            let acted = matches!(step, Step::Leave(_))
+                || keys.last_notice().is_some()
+                || keys.dashboard.prompting().is_some()
+                || keys.dashboard.confirming().is_some()
+                || keys.dashboard.showing_detail()
+                || keys.dashboard.logs().is_some()
+                || keys.dashboard.showing_help();
+            assert!(
+                acted,
+                "ports menu entry {index} ({:?}, key {:?}) did nothing at all",
+                item.label, item.key
+            );
+        }
+    }
+
+    #[test]
+    fn the_menu_offers_to_end_a_port_only_when_something_owns_it() {
+        let keys = Keyboard::new().with_a_service().with_listeners();
+        let (subject, items) = menu_for(&keys.dashboard).unwrap();
+        assert!(
+            subject.contains("3306"),
+            "the menu says which port it is about; got {subject}"
+        );
+        assert!(
+            items.iter().any(|item| item.key == 'K'),
+            "3306 has a pid, so ending it is on offer"
+        );
+
+        // The second listener has no pid: nothing to end, so nothing offered.
+        let mut keys = Keyboard::new().with_a_service().with_listeners();
+        keys.dashboard.move_selection(1);
+        let (_, items) = menu_for(&keys.dashboard).unwrap();
+        assert!(
+            !items.iter().any(|item| item.key == 'K'),
+            "offering to end a process nobody can name is offering to end nothing"
+        );
+    }
+
+    #[test]
+    fn ending_a_port_names_what_it_is_about_to_end_and_waits() {
+        let mut keys = Keyboard::new().with_a_service().with_listeners();
+
+        keys.press(KeyCode::Char('K'));
+        let question = keys.dashboard.confirming().unwrap_or_default().to_string();
+        assert!(
+            question.contains("docker-proxy")
+                && question.contains("1085")
+                && question.contains("3306"),
+            "the process, its number and its port, so a wrong answer is visible \
+             before it is given; got {question}"
+        );
+        assert!(
+            keys.pending.is_some(),
+            "and the action waits rather than having happened already"
+        );
+    }
+
+    #[test]
+    fn a_port_nothing_owns_cannot_be_ended() {
+        let mut keys = Keyboard::new().with_a_service().with_listeners();
+        keys.dashboard.move_selection(1);
+
+        keys.press(KeyCode::Char('K'));
+        assert!(
+            keys.dashboard.confirming().is_none(),
+            "there is no process to end, so there is nothing to ask about"
+        );
+        assert!(keys.pending.is_none());
+    }
+
+    #[test]
+    fn opening_from_the_ports_pane_uses_the_port_under_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut keys = Keyboard::new().with_a_service().with_listeners();
+        keys.config = harmless(dir.path());
+
+        // 5173 belongs to no container, so the service branch cannot answer
+        // and the listener has to.
+        keys.dashboard.move_selection(1);
+        keys.press(KeyCode::Char('o'));
+        let said = keys.last_notice().unwrap_or_default();
+        assert!(
+            said.contains("5173"),
+            "a stray dev server is still worth opening; got {said}"
+        );
+    }
+
+    #[test]
+    fn a_row_that_is_a_container_reaches_that_container_from_the_ports_pane() {
+        let mut keys = Keyboard::new().with_a_service().with_listeners();
+        // 3306 is mysql's published port, so start and stop must reach mysql
+        // even though the cursor is in a list of ports.
+        keys.press(KeyCode::Char('x'));
+        assert_eq!(
+            keys.last_notice().as_deref(),
+            Some("stopping mysql-db…"),
+            "the ports pane acts on the container behind the port"
+        );
+    }
+
+    #[test]
+    fn refreshing_the_ports_pane_rereads_the_ports_and_not_only_the_services() {
+        let mut keys = Keyboard::new().with_a_service().with_listeners();
+        keys.press(KeyCode::Char('r'));
+        assert_eq!(
+            keys.last_notice().as_deref(),
+            Some("rereading ports"),
+            "the pane names the container behind each port, so both are reread"
+        );
     }
 }
