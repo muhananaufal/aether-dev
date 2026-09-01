@@ -152,3 +152,38 @@ domains = "domains.toml"
 # [backup]
 # directory = "backups"
 # gzip = false
+
+# The external programs this runs, where naming the command is enough.
+#
+# [tools]
+# git = "git"                        # a bare name is found on PATH
+# kill = ["taskkill", "/PID", "{pid}", "/F"]   # {pid} is where the number goes
+# kill = ["kill", "-TERM", "{pid}"]            # elsewhere
+
+# How this machine is asked what is listening.
+#
+# Each probe names a command AND the shape of its output, because the two are
+# not interchangeable: read as the wrong one, real output still produces a list
+# of ports - just with every process name missing and connections counted as
+# listeners. A list that looks complete and is not.
+#
+# Formats: "windows-netstat", "linux-netstat", "ss".
+#
+# They are tried in order until one answers, which is how a machine without
+# iproute2 still gets an answer. The defaults are:
+#
+#   Windows  netstat -ano -p TCP, then tasklist for the names
+#   Linux    ss -lntpH, then netstat -lntp
+#   macOS    nothing — no capture of a real machine's output exists to write
+#            a parser against, so set one here rather than be given a guess
+#
+# [[ports.probe]]
+# command = ["ss", "-lntpH"]
+# format = "ss"
+#
+# [[ports.probe]]
+# command = ["netstat", "-lntp"]
+# format = "linux-netstat"
+#
+# [ports]
+# names = ["tasklist", "/NH", "/FO", "CSV"]   # only for formats with no names

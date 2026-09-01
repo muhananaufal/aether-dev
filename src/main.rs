@@ -81,7 +81,7 @@ fn main() -> ExitCode {
         Command::Scan { json } => scan(&config, json, chosen.as_deref()),
         Command::Services { json, memory } => services(&config, json, memory),
         Command::Ports { json } => ports(&config, json),
-        Command::Kill { port, dry_run } => kill(port, dry_run),
+        Command::Kill { port, dry_run } => kill(&config, port, dry_run),
         Command::Open { target } => open(&config, &target),
         Command::Dotenv { project, use_file } => dotenv(&config, &project, use_file.as_deref()),
         Command::Db(command) => db(&config, command),
@@ -124,8 +124,10 @@ struct Failure<'a> {
 
 fn scan(config: &Config, json: bool, chosen: Option<&Path>) -> ExitCode {
     let started = Instant::now();
-    let scanner =
-        FsProjectScanner::new(GitCli::new(config.scan.git_timeout_ms), config.scan.workers);
+    let scanner = FsProjectScanner::new(
+        GitCli::new(config.scan.git_timeout_ms, &config.tools.git),
+        config.scan.workers,
+    );
     let project_config = config.project.clone();
     let (sender, receiver) = std::sync::mpsc::channel();
 
@@ -343,7 +345,7 @@ struct PortRow<'a> {
 /// a stray dev server rather than a container. Listing only what docker
 /// published answers a narrower question than the one being asked.
 fn ports(config: &Config, json: bool) -> ExitCode {
-    let listeners = match listen::listening() {
+    let listeners = match listen::listening(&config.ports) {
         Ok(listeners) => listeners,
         Err(error) => {
             eprintln!("adev: {error}");
@@ -409,8 +411,8 @@ fn ports(config: &Config, json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn kill(port: u16, dry_run: bool) -> ExitCode {
-    let listeners = match listen::listening() {
+fn kill(config: &Config, port: u16, dry_run: bool) -> ExitCode {
+    let listeners = match listen::listening(&config.ports) {
         Ok(listeners) => listeners,
         Err(error) => {
             eprintln!("adev: {error}");
@@ -431,7 +433,7 @@ fn kill(port: u16, dry_run: bool) -> ExitCode {
         outln!("would end {name} ({pid}), which holds {port}");
         return ExitCode::SUCCESS;
     }
-    match listen::terminate(pid) {
+    match listen::terminate(&config.tools.kill, pid) {
         Ok(()) => {
             outln!("ended {name} ({pid}); {port} is free");
             ExitCode::SUCCESS
@@ -449,7 +451,7 @@ fn kill(port: u16, dry_run: bool) -> ExitCode {
 fn spawn_collectors(config: &Config, updates: Sender<Update>) {
     spawn_project_collector(config, updates.clone());
     spawn_service_collector(config, updates.clone());
-    spawn_port_collector(updates);
+    spawn_port_collector(config, updates);
 }
 
 /// Asks the machine what is listening, which is a different question from what
@@ -459,9 +461,10 @@ fn spawn_collectors(config: &Config, updates: Sender<Update>) {
 /// runs netstat and then tasklist. Both are single calls whatever the port
 /// count, so the cost is flat - and it happens on a thread, where a slow answer
 /// holds up nothing but itself.
-fn spawn_port_collector(updates: Sender<Update>) {
+fn spawn_port_collector(config: &Config, updates: Sender<Update>) {
+    let ports = config.ports.clone();
     std::thread::spawn(move || {
-        let update = match listen::listening() {
+        let update = match listen::listening(&ports) {
             Ok(listeners) => Update::Ports(listeners),
             Err(error) => Update::PortsFailed(error.to_string()),
         };
@@ -477,9 +480,10 @@ fn spawn_project_collector(config: &Config, updates: Sender<Update>) {
     let project_config = config.project.clone();
     let workers = config.scan.workers;
     let git_timeout = config.scan.git_timeout_ms;
+    let git = config.tools.git.clone();
     let scan_updates = updates.clone();
     std::thread::spawn(move || {
-        let scanner = FsProjectScanner::new(GitCli::new(git_timeout), workers);
+        let scanner = FsProjectScanner::new(GitCli::new(git_timeout, git), workers);
         let (found, results) = mpsc::channel();
         std::thread::spawn(move || scanner.scan(&project_config, found));
         for event in results {
@@ -882,14 +886,16 @@ fn dotenv_detail(name: &str, path: &Path) -> Detail {
 /// Ends a process for the dashboard, then re-reads what is listening: leaving
 /// a row for a process that is gone would be the screen lying about the thing
 /// it was just used to change.
-fn spawn_kill(pid: u32, label: String, updates: Sender<Update>) {
+fn spawn_kill(config: &Config, pid: u32, label: String, updates: Sender<Update>) {
+    let ports = config.ports.clone();
+    let kill = config.tools.kill.clone();
     std::thread::spawn(move || {
-        let notice = match listen::terminate(pid) {
+        let notice = match listen::terminate(&kill, pid) {
             Ok(()) => Notice::done(format!("killed {label}")),
             Err(error) => Notice::failed(format!("{label}: {error}")),
         };
         let _ = updates.send(Update::Notice(notice));
-        if let Ok(listeners) = listen::listening() {
+        if let Ok(listeners) = listen::listening(&ports) {
             let _ = updates.send(Update::Ports(listeners));
         }
     });
@@ -1084,7 +1090,7 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                     (true, Some(Pending::Kill { pid, label })) => {
                         dashboard
                             .apply(Update::Notice(Notice::working(format!("killing {label}"))));
-                        spawn_kill(pid, label, updates.clone());
+                        spawn_kill(config, pid, label, updates.clone());
                     }
                     (
                         true,
@@ -1296,7 +1302,7 @@ fn tui(config: &Config, chosen: Option<&Path>) -> ExitCode {
                     Pane::Ports => {
                         dashboard.apply(Update::Notice(Notice::working("rereading ports")));
                         spawn_service_collector(config, updates.clone());
-                        spawn_port_collector(updates.clone());
+                        spawn_port_collector(config, updates.clone());
                     }
                 },
                 KeyCode::Char('R') => {
@@ -2215,8 +2221,10 @@ fn locate_project(config: &Config, wanted: &str) -> Result<(String, PathBuf), Ex
         return Ok((name, direct.to_path_buf()));
     }
 
-    let scanner =
-        FsProjectScanner::new(GitCli::new(config.scan.git_timeout_ms), config.scan.workers);
+    let scanner = FsProjectScanner::new(
+        GitCli::new(config.scan.git_timeout_ms, &config.tools.git),
+        config.scan.workers,
+    );
     let (sender, receiver) = mpsc::channel();
     let roots = config.project.clone();
     std::thread::spawn(move || scanner.scan(&roots, sender));

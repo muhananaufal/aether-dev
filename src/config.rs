@@ -3,6 +3,7 @@
 //! layout and could therefore never run on anyone else's.
 
 use crate::catalog::ServiceConfig;
+use crate::listen::PortsConfig;
 use crate::memory::MemoryConfig;
 use crate::open::OpenConfig;
 use crate::recipe::RunOverride;
@@ -59,6 +60,10 @@ pub struct Config {
     pub memory: MemoryConfig,
     /// Where the dashboard puts a backup, since it has nowhere to ask.
     pub backup: BackupConfig,
+    /// How this machine is asked what is listening, and what ends a process.
+    pub ports: PortsConfig,
+    /// The external programs everything else runs.
+    pub tools: ToolsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -154,6 +159,28 @@ impl Default for BackupConfig {
             // exists to undo.
             directory: PathBuf::from("backups"),
             gzip: false,
+        }
+    }
+}
+
+/// The external programs this runs, for the ones where naming the command is
+/// enough - nothing here has to agree with a parser, so these are plain
+/// command lines.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ToolsConfig {
+    /// A bare `git` is found on PATH, which is right almost always and wrong
+    /// on a machine with more than one.
+    pub git: String,
+    /// What ends a process. `{pid}` is where the number goes.
+    pub kill: Vec<String>,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            git: "git".to_string(),
+            kill: crate::listen::default_kill(),
         }
     }
 }
